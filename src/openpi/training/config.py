@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.drema_policy as drema_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -347,6 +348,47 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class DremaDataConfig(DataConfigFactory):
+    """Data config for the DREMA dataset: single front camera, no wrist, no state input.
+
+    Mirrors LeRobotLiberoDataConfig but uses DremaInputs/DremaOutputs, which mask out the
+    (duplicated) wrist image. State is left in the pipeline but is unused by pi0.5 when
+    discrete_state_input=False, so the policy operates on the front image + prompt only.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap dataset keys to the keys the transforms expect. We intentionally drop the
+        # dataset's `wrist_image` (a copy of the front image) -- DremaInputs zero-fills it.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[drema_policy.DremaInputs(model_type=model_config.model_type)],
+            outputs=[drema_policy.DremaOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -760,6 +802,264 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning pi05 on the custom DREMA LeRobot dataset (data/drema_real_data_20eps).
+    # Front camera + instruction only (DremaInputs masks the duplicated wrist image; pi05 with
+    # discrete_state_input=False does not consume robot state). Set HF_LEROBOT_HOME to the dir
+    # that *contains* `drema_real_data_20eps` (the repo's `data/` dir) so the repo_id resolves.
+    #
+    # Two training regimes per method, named by batch size / steps:
+    #   _b8_150k  -> batch 8,  150k steps, 10k warmup  (mirrors OpenVLA-OFT baseline step-for-step)
+    #   _b32_15k  -> batch 32, 15k steps,  1k warmup   (GPU-efficient; fewer steps, larger batch)
+    # cosine decay_steps is matched to num_train_steps so the schedule anneals over the full run.
+    #
+    # --- Full fine-tune. Single GPU (fsdp_devices=1); bump to 4 + --gpus=4 to shard if it OOMs. ---
+    TrainConfig(
+        name="pi05_drema_full_b8_150k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="drema_real_data_20eps",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=150_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=150_000,
+        # Full-FT checkpoints are ~42 GB each (params + Adam mu/nu + EMA). Keep a milestone every
+        # 50k steps (-> <=3 permanent ckpts, ~126 GB, under the 1 TB project quota), but save every
+        # 10k so a crash never loses more than 10k steps (max_to_keep=1 prunes the non-milestones).
+        save_interval=10_000,
+        keep_period=50_000,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_drema_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="drema_real_data_20eps",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps -> 2 permanent checkpoints (7500 + final).
+        save_interval=7_500,
+        keep_period=7_500,
+        fsdp_devices=1,
+    ),
+    # --- LoRA fine-tune. Fits comfortably on a single GPU. EMA disabled per LoRA convention. ---
+    TrainConfig(
+        name="pi05_drema_lora_b8_150k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="drema_real_data_20eps",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=2.5e-5,
+            decay_steps=150_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=150_000,
+        # Keep a milestone every 50k steps; save every 10k for crash recovery (see full-FT note).
+        save_interval=10_000,
+        keep_period=50_000,
+        # Freeze filter must match the LoRA model variants chosen above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_drema_lora_b32_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="drema_real_data_20eps",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        # Freeze filter must match the LoRA model variants chosen above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Same setup as the DREMA configs above (front camera + instruction only, no wrist, no state)
+    # but trained on the LIBERO-object dataset (data/libero_object_original_filtered3ep_lrd).
+    # NOTE: this LIBERO set has a *real* wrist camera; DremaDataConfig deliberately masks it so the
+    # input setup is identical to the real-robot DREMA runs. Hyperparameters are copied verbatim;
+    # only the name and repo_id differ.
+    #
+    TrainConfig(
+        name="pi05_drema_libero_full_b8_150k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="libero_object_original_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=150_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=150_000,
+        # Full-FT checkpoints are ~42 GB each (params + Adam mu/nu + EMA). Keep a milestone every
+        # 50k steps (-> <=3 permanent ckpts, ~126 GB, under the 1 TB project quota), but save every
+        # 10k so a crash never loses more than 10k steps (max_to_keep=1 prunes the non-milestones).
+        save_interval=10_000,
+        keep_period=50_000,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_drema_libero_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="libero_object_original_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps -> 2 permanent checkpoints (7500 + final).
+        save_interval=7_500,
+        keep_period=7_500,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
+        name="pi05_drema_libero_lora_b8_150k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="libero_object_original_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=2.5e-5,
+            decay_steps=150_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=150_000,
+        # Keep a milestone every 50k steps; save every 10k for crash recovery (see full-FT note).
+        save_interval=10_000,
+        keep_period=50_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_drema_libero_lora_b32_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="libero_object_original_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.
