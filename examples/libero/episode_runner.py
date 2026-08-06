@@ -2,6 +2,11 @@
 
 Used by the single-job client (main_plus.py) and by the sharded runner
 (plus_system/run_shard.py) so both execute exactly the same episode.
+
+The rollout constants here (resize_size=224, num_steps_wait=10, horizon=5000,
+LIBERO_DUMMY_ACTION) determine the results and sit outside the eval fingerprint by
+design: they are pinned, not configured. Changing any of them invalidates comparisons
+with episodes already collected, so never change them mid-collection.
 """
 
 import collections
@@ -9,7 +14,7 @@ import dataclasses
 import logging
 import math
 import pathlib
-from typing import List
+from typing import List, Optional
 
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -27,6 +32,7 @@ class EpisodeResult:
     success: bool
     num_policy_steps: int  # actions actually executed (excludes the settling steps)
     replay_images: List  # empty when record_images=False
+    error: Optional[str] = None  # set when the episode was cut short by an exception
 
 
 def make_libero_env(task, resolution, seed):
@@ -71,6 +77,7 @@ def run_episode(
     t = 0
     num_policy_steps = 0
     done = False
+    error = None
     replay_images = []
 
     while t < max_steps + num_steps_wait:
@@ -127,9 +134,12 @@ def run_episode(
 
         except Exception as e:
             logging.error(f"Caught exception: {e}")
+            error = f"{type(e).__name__}: {e}"
             break
 
-    return EpisodeResult(success=bool(done), num_policy_steps=num_policy_steps, replay_images=replay_images)
+    return EpisodeResult(
+        success=bool(done), num_policy_steps=num_policy_steps, replay_images=replay_images, error=error
+    )
 
 
 def quat2axisangle(quat):

@@ -5,6 +5,10 @@ Consumes a shard file written by generate_manifest.py, evaluates the variants th
 worker owns, and appends one JSON line per episode to the shard's result directory.
 Re-running is idempotent: episodes already recorded by any worker are skipped.
 
+Episodes that end in an exception (dead server, sim crash) are NOT recorded, so a
+retry picks them up; a run that hits MAX_CONSECUTIVE_ERRORS of them aborts loudly
+instead of writing an infrastructure outage down as thousands of task failures.
+
 The libero/numpy imports live inside the functions that need them so the bookkeeping
 logic here stays importable (and testable) without a simulator install.
 """
@@ -18,17 +22,43 @@ import logging
 import os
 import pathlib
 import sys
+import tempfile
 import time
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 LIBERO_EXAMPLE_DIR = pathlib.Path(__file__).resolve().parents[1]  # holds episode_runner, imported flat
 FINGERPRINT_FILE = "fingerprint.txt"
 EPISODE_FILE_GLOB = "episodes_worker*.jsonl"
-LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+MAX_CONSECUTIVE_ERRORS = 3
+SERVER_WAIT_TIMEOUT_S = 15 * 60
+
+REQUIRED_SPEC_KEYS = (
+    "eval_name",
+    "config_fingerprint",
+    "checkpoint_config",
+    "checkpoint_step",
+    "task_suite",
+    "replan_steps",
+    "seed",
+    "max_steps",
+    "num_workers",
+    "save_videos",
+    "trials_per_variant",
+    "shard_index",
+    "result_dir",
+    "variants",
+)
 
 
 def load_shard_spec(shard_file: pathlib.Path) -> dict:
     return json.loads(pathlib.Path(shard_file).read_text())
+
+
+def validate_spec(spec: dict) -> None:
+    """Fail before touching the result dir if the shard file is missing anything we read."""
+    missing = [key for key in REQUIRED_SPEC_KEYS if key not in spec]
+    if missing:
+        raise SystemExit(f"Shard spec is missing required keys: {missing}")
 
 
 def resolve_result_dir(spec: dict, repo_root: pathlib.Path) -> pathlib.Path:
@@ -45,6 +75,8 @@ def check_fingerprint(result_dir: pathlib.Path, fingerprint: str) -> None:
     path = result_dir / FINGERPRINT_FILE
     if path.is_file():
         existing = path.read_text().strip()
+        if not existing:
+            raise SystemExit(f"Corrupt fingerprint file {path}: empty. Delete it if the result dir is trustworthy.")
         if existing != fingerprint:
             raise SystemExit(
                 f"Fingerprint mismatch in {result_dir}:\n"
@@ -54,10 +86,11 @@ def check_fingerprint(result_dir: pathlib.Path, fingerprint: str) -> None:
                 "or regenerate with generate_manifest.py --force --discard-results."
             )
         return
-    # Racing workers write identical content, so a plain write+rename is enough.
-    tmp_path = result_dir / f"{FINGERPRINT_FILE}.tmp{os.getpid()}"
-    tmp_path.write_text(fingerprint + "\n")
-    os.replace(str(tmp_path), str(path))
+    # Racing workers write identical content, so write to a private temp file and rename.
+    handle, tmp_name = tempfile.mkstemp(dir=str(result_dir), prefix=FINGERPRINT_FILE, suffix=".tmp")
+    with os.fdopen(handle, "w") as tmp_file:
+        tmp_file.write(fingerprint + "\n")
+    os.replace(tmp_name, str(path))
 
 
 def load_done_episodes(result_dir: pathlib.Path) -> set:
@@ -65,8 +98,8 @@ def load_done_episodes(result_dir: pathlib.Path) -> set:
     done = set()
     for path in sorted(pathlib.Path(result_dir).glob(EPISODE_FILE_GLOB)):
         with path.open() as episode_file:
-            for line_number, line in enumerate(episode_file, 1):
-                line = line.strip()
+            for line_number, raw_line in enumerate(episode_file, 1):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
@@ -82,6 +115,25 @@ def load_done_episodes(result_dir: pathlib.Path) -> set:
 def owned_variants(variants: list, worker_id: int, num_workers: int) -> list:
     """Stride assignment over spec order: workers together cover the shard exactly once."""
     return variants[worker_id::num_workers]
+
+
+def pending_episodes(variants: list, trials_per_variant: int, done_episodes: set) -> list:
+    """(variant, trial indices still to run) for every variant with outstanding trials."""
+    pending = []
+    for variant in variants:
+        trials = [t for t in range(trials_per_variant) if (variant["name"], t) not in done_episodes]
+        if trials:
+            pending.append((variant, trials))
+    return pending
+
+
+def episodes_file_name(worker_id: int, run_id: str) -> str:
+    """One file per (worker, run): overlapping launches must never append to the same file."""
+    return f"episodes_worker{worker_id:02d}_{run_id}.jsonl"
+
+
+def current_run_id() -> str:
+    return os.environ.get("SLURM_JOB_ID") or str(os.getpid())
 
 
 def init_state_index(trial_idx: int, num_init_states: int) -> int:
@@ -100,7 +152,7 @@ def should_record_images(save_videos: str, trial_idx: int) -> bool:
     raise ValueError(f"Unknown save_videos policy: {save_videos}")
 
 
-def should_save_video(save_videos: str, trial_idx: int, success: bool) -> bool:
+def should_save_video(save_videos: str, trial_idx: int, *, success: bool) -> bool:
     if save_videos == "all":
         return True
     if save_videos == "failures_first_trial":
@@ -116,9 +168,10 @@ def episode_record(
     variant: dict,
     trial_idx: int,
     init_state_idx: int,
-    success: bool,
     num_policy_steps: int,
     wall_time_s: float,
+    *,
+    success: bool,
 ) -> dict:
     return {
         "eval_name": spec["eval_name"],
@@ -135,6 +188,7 @@ def episode_record(
         "init_state_idx": init_state_idx,
         "success": success,
         "num_policy_steps": num_policy_steps,
+        "max_steps": spec["max_steps"],  # lets the aggregator tell a timeout from an early stop
         "wall_time_s": round(wall_time_s, 2),
         "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "config_fingerprint": spec["config_fingerprint"],
@@ -147,59 +201,70 @@ def append_record(episodes_path: pathlib.Path, record: dict) -> None:
         episode_file.flush()
 
 
+def connect_policy_client(host: str, port: int, timeout_s: int = SERVER_WAIT_TIMEOUT_S):
+    """Wait for the policy server, but bound the wait: a launcher bug must fail, not burn the walltime."""
+    import signal
+
+    from openpi_client import websocket_client_policy
+
+    def on_timeout(signum, frame):
+        raise TimeoutError
+
+    previous_handler = signal.signal(signal.SIGALRM, on_timeout)
+    signal.alarm(timeout_s)
+    try:
+        return websocket_client_policy.WebsocketClientPolicy(host, port)
+    except TimeoutError:
+        raise SystemExit(f"No policy server at {host}:{port} after {timeout_s // 60} min; giving up.") from None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def run_worker(
     spec: dict,
     result_dir: pathlib.Path,
-    variants: list,
-    done_episodes: set,
+    pending: list,
+    completed: int,
+    owned_episodes: int,
     worker_id: int,
     host: str,
     port: int,
 ) -> None:
-    """Evaluate this worker's variants; heavy imports happen here, not at module import."""
+    """Evaluate this worker's pending episodes; heavy imports happen here, not at module import."""
     sys.path.insert(0, str(LIBERO_EXAMPLE_DIR))
     import imageio
     from libero.libero import benchmark
     import numpy as np
-    from openpi_client import websocket_client_policy
 
+    from episode_runner import LIBERO_ENV_RESOLUTION
     from episode_runner import make_libero_env
     from episode_runner import run_episode
 
-    np.random.seed(spec["seed"])
-    trials_per_variant = spec["trials_per_variant"]
     save_videos = spec["save_videos"]
-    episodes_path = result_dir / f"episodes_worker{worker_id:02d}.jsonl"
+    episodes_path = result_dir / episodes_file_name(worker_id, current_run_id())
     video_dir = result_dir / "videos"
-
-    owned_episodes = len(variants) * trials_per_variant
-    pending = [
-        (variant, [t for t in range(trials_per_variant) if (variant["name"], t) not in done_episodes])
-        for variant in variants
-    ]
-    pending = [(variant, trials) for variant, trials in pending if trials]
-    completed = owned_episodes - sum(len(trials) for _, trials in pending)
-    episodes_run, successes_run = 0, 0
-    logging.info(f"Worker {worker_id}: {len(variants)} variants, {completed}/{owned_episodes} episodes already done")
-    if not pending:
-        logging.info(f"Worker {worker_id}: nothing to do")
-        return
 
     task_suite = benchmark.get_benchmark_dict()[spec["task_suite"]]()
     name_to_task_id = {task_suite.get_task(i).name: i for i in range(task_suite.n_tasks)}
+    unknown = [variant["name"] for variant, _ in pending if variant["name"] not in name_to_task_id]
+    if unknown:
+        raise SystemExit(f"{len(unknown)} variants are not in task suite '{spec['task_suite']}': {unknown}")
 
-    client = websocket_client_policy.WebsocketClientPolicy(host, port)
+    client = connect_policy_client(host, port)
 
+    episodes_run, successes_run, consecutive_errors = 0, 0, 0
     for variant, pending_trials in pending:
-        task_id = name_to_task_id.get(variant["name"])
-        if task_id is None:
-            raise SystemExit(f"Variant '{variant['name']}' is not in task suite '{spec['task_suite']}'")
+        task_id = name_to_task_id[variant["name"]]
         init_states = task_suite.get_task_init_states(task_id)
         env, task_description = make_libero_env(task_suite.get_task(task_id), LIBERO_ENV_RESOLUTION, spec["seed"])
 
         try:
             for trial_idx in pending_trials:
                 init_state_idx = init_state_index(trial_idx, len(init_states))
+                # Per-trial seed: env.seed() reseeds the global numpy RNG that the perturbations draw
+                # from, so a resumed trial sees the same stream it would have seen in one long run.
+                env.seed(spec["seed"] + trial_idx)
                 started_at = time.time()
                 result = run_episode(
                     env,
@@ -212,15 +277,23 @@ def run_worker(
                 )
                 wall_time_s = time.time() - started_at
 
-                if should_save_video(save_videos, trial_idx, result.success):
-                    video_dir.mkdir(parents=True, exist_ok=True)
-                    suffix = "success" if result.success else "failure"
-                    imageio.mimwrite(
-                        video_dir / f"{variant['name']}_t{trial_idx}_{suffix}.mp4",
-                        [np.asarray(image) for image in result.replay_images],
-                        fps=10,
+                if result.error is not None:
+                    # Infrastructure failure, not a task failure: leave it unrecorded so a retry reruns it.
+                    consecutive_errors += 1
+                    logging.error(
+                        "w{} {} t{} aborted after {:.1f}s ({}); not recorded, {} in a row".format(
+                            worker_id, variant["name"], trial_idx, wall_time_s, result.error, consecutive_errors
+                        )
                     )
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        raise SystemExit(
+                            f"w{worker_id}: {consecutive_errors} consecutive failed episodes "
+                            f"(last: {result.error}); aborting instead of recording them as task failures."
+                        )
+                    continue
+                consecutive_errors = 0
 
+                # Record first: the JSONL line is authoritative, the video is a debugging aid.
                 append_record(
                     episodes_path,
                     episode_record(
@@ -229,17 +302,26 @@ def run_worker(
                         variant,
                         trial_idx,
                         init_state_idx,
-                        result.success,
                         result.num_policy_steps,
                         wall_time_s,
+                        success=result.success,
                     ),
                 )
+                if should_save_video(save_videos, trial_idx, success=result.success):
+                    video_dir.mkdir(parents=True, exist_ok=True)
+                    suffix = "success" if result.success else "failure"
+                    imageio.mimwrite(
+                        video_dir / f"{variant['name']}_t{trial_idx}_{suffix}.mp4",
+                        [np.asarray(image) for image in result.replay_images],
+                        fps=10,
+                    )
 
                 completed += 1
                 episodes_run += 1
                 successes_run += int(result.success)
                 logging.info(
-                    "[{}/{}] {} t{} {} ({} steps, {:.1f}s) | this run: {}/{} ({:.1f}%)".format(
+                    "w{} [{}/{}] {} t{} {} ({} steps, {:.1f}s) | this run: {}/{} ({:.1f}%)".format(
+                        worker_id,
                         completed,
                         owned_episodes,
                         variant["name"],
@@ -255,7 +337,7 @@ def run_worker(
         finally:
             env.close()
 
-    logging.info(f"Worker {worker_id} done: {completed}/{owned_episodes} owned episodes recorded ({episodes_run} here)")
+    logging.info(f"w{worker_id} done: {completed}/{owned_episodes} owned episodes recorded ({episodes_run} here)")
 
 
 def main() -> None:
@@ -276,18 +358,30 @@ def main() -> None:
         raise SystemExit(f"Invalid worker {args.worker_id} of {args.num_workers}")
 
     spec = load_shard_spec(args.shard_file)
+    validate_spec(spec)
+    if args.num_workers != spec["num_workers"]:
+        logging.warning(f"Launched with {args.num_workers} workers, but the spec plans for {spec['num_workers']}.")
+
     result_dir = resolve_result_dir(spec, args.repo_root)
     result_dir.mkdir(parents=True, exist_ok=True)
     check_fingerprint(result_dir, spec["config_fingerprint"])
-
-    variants = owned_variants(spec["variants"], args.worker_id, args.num_workers)
-    done_episodes = load_done_episodes(result_dir)
     logging.info(
         "Shard {} of eval '{}' ({}@{}) -> {}".format(
             spec["shard_index"], spec["eval_name"], spec["checkpoint_config"], spec["checkpoint_step"], result_dir
         )
     )
-    run_worker(spec, result_dir, variants, done_episodes, args.worker_id, args.host, args.port)
+
+    variants = owned_variants(spec["variants"], args.worker_id, args.num_workers)
+    trials_per_variant = spec["trials_per_variant"]
+    pending = pending_episodes(variants, trials_per_variant, load_done_episodes(result_dir))
+    owned_episodes = len(variants) * trials_per_variant
+    completed = owned_episodes - sum(len(trials) for _, trials in pending)
+    logging.info(f"w{args.worker_id}: {len(variants)} variants, {completed}/{owned_episodes} episodes already done")
+    if not pending:
+        logging.info(f"w{args.worker_id}: nothing to do")
+        return
+
+    run_worker(spec, result_dir, pending, completed, owned_episodes, args.worker_id, args.host, args.port)
 
 
 if __name__ == "__main__":
