@@ -147,6 +147,15 @@ def select_variants(
     return variants, skipped_null_difficulty
 
 
+def normalize_excluded_families(value: object) -> list[str]:
+    """Read the optional exclude_noise_families field; absent or null means exclude nothing."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(family, str) for family in value):
+        raise SystemExit(f"exclude_noise_families must be a list of family names, got {value!r}")
+    return value
+
+
 def exclude_noise_families(variants: list[dict], families: list[str]) -> tuple[list[dict], dict[str, int]]:
     """Drop variants whose _noise_<N> suffix falls in an excluded family's band.
 
@@ -191,9 +200,10 @@ def compute_fingerprint(resolved_config: dict, variants: list[dict]) -> str:
     moves variants between result dirs, which is exactly the double-counting hazard.
     """
     payload_config = {field: resolved_config[field] for field in FINGERPRINT_FIELDS}
-    # exclude_noise_families is result-determining, but it only enters the payload when it
-    # actually excludes something: configs that never set it keep the fingerprint they were
-    # first generated under, so their already collected episodes still verify.
+    # exclude_noise_families is result-determining, so it enters the payload whenever it is
+    # non-empty (whether or not it happened to drop a variant). An absent or empty field is
+    # left out entirely, so configs that never set it keep the fingerprint they were first
+    # generated under and their already collected episodes still verify.
     if resolved_config.get("exclude_noise_families"):
         payload_config["exclude_noise_families"] = sorted(resolved_config["exclude_noise_families"])
     payload = json.dumps(
@@ -235,6 +245,7 @@ def main() -> None:
     unknown = [key for key in config["perturbations"] if key not in PERTURBATION_CATEGORIES]
     if unknown:
         raise SystemExit(f"Unknown perturbation keys {unknown}; valid keys: {sorted(PERTURBATION_CATEGORIES)}")
+    requested_families = normalize_excluded_families(config.get("exclude_noise_families"))
 
     output_dir = RESULTS_ROOT / config["name"]
     if output_dir.exists() and not args.force:
@@ -255,7 +266,6 @@ def main() -> None:
     variants, skipped_null_difficulty = select_variants(
         records, config["perturbations"], config["difficulties"], config["base_tasks"]
     )
-    requested_families = config.get("exclude_noise_families", [])
     excluded_counts = {}
     if requested_families:
         variants, excluded_counts = exclude_noise_families(variants, requested_families)

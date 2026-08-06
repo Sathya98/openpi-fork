@@ -68,9 +68,21 @@ differing = [
 ]
 if "classification_json" in config and config["classification_json"] != stored["classification_json"]:
     differing.append("classification_json")
-# Optional field: a manifest generated before it existed means "exclude nothing".
-if sorted(config.get("exclude_noise_families", [])) != sorted(stored.get("exclude_noise_families", [])):
+
+# Optional field: absent (a manifest generated before it existed) or null means "exclude nothing".
+def excluded_families(source, source_name):
+    value = source.get("exclude_noise_families")
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(family, str) for family in value):
+        raise SystemExit(
+            "ERROR: {} exclude_noise_families must be a list of family names, got {!r}".format(source_name, value)
+        )
+    return sorted(value)
+
+if excluded_families(config, sys.argv[1]) != excluded_families(stored, sys.argv[2]):
     differing.append("exclude_noise_families")
+
 # The generator clamps num_shards to the number of selected variants.
 if stored["num_shards"] != min(config["num_shards"], manifest["totals"]["num_variants"]):
     differing.append("num_shards")

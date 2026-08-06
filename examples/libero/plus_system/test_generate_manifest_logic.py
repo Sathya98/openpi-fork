@@ -59,6 +59,23 @@ def test_variants_without_a_noise_suffix_are_kept():
     assert {v["name"] for v in others} <= {v["name"] for v in kept}
 
 
+def test_absent_or_null_field_excludes_nothing():
+    assert generate_manifest.normalize_excluded_families(None) == []
+    assert generate_manifest.normalize_excluded_families([]) == []
+    assert generate_manifest.normalize_excluded_families(["fog"]) == ["fog"]
+
+
+def test_non_list_field_is_refused():
+    """A bare string is iterable, so it would otherwise be read one character at a time."""
+    for value in ("glass_blur", {"glass_blur": True}, ["glass_blur", 3]):
+        try:
+            generate_manifest.normalize_excluded_families(value)
+        except SystemExit as error:
+            assert "must be a list" in str(error), str(error)
+        else:
+            raise AssertionError(f"a non-list exclude_noise_families was accepted: {value!r}")
+
+
 def test_unknown_family_is_refused():
     try:
         generate_manifest.exclude_noise_families(noise_variants(), ["glass_blurr"])
