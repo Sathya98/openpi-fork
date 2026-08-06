@@ -1,5 +1,6 @@
 import collections
 import dataclasses
+import json
 import logging
 import math
 import pathlib
@@ -13,6 +14,8 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+
+from libero_eef_control_wrapper import LiberoEEFControlWrapper
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -57,6 +60,16 @@ def eval_libero(args: Args) -> None:
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
+    # Success statistics, written to JSON after every task (partial results survive job kills).
+    results_path = pathlib.Path(args.video_out_path).parent / "results.json"
+    results = {
+        "task_suite": args.task_suite_name,
+        "num_trials_per_task": args.num_trials_per_task,
+        "replan_steps": args.replan_steps,
+        "seed": args.seed,
+        "tasks": {},
+    }
+
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
     elif args.task_suite_name == "libero_object":
@@ -86,6 +99,7 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        episode_successes = []
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -163,6 +177,7 @@ def eval_libero(args: Args) -> None:
 
             task_episodes += 1
             total_episodes += 1
+            episode_successes.append(bool(done))
 
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
@@ -182,6 +197,23 @@ def eval_libero(args: Args) -> None:
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
+        results["tasks"][task_description] = {
+            "successes": task_successes,
+            "failures": task_episodes - task_successes,
+            "num_trials": task_episodes,
+            "success_rate": task_successes / task_episodes,
+            "episode_successes": episode_successes,
+        }
+        results["total"] = {
+            "num_trials": total_episodes,
+            "successes": total_successes,
+            "failures": total_episodes - total_successes,
+            "success_rate": total_successes / total_episodes,
+        }
+        results_path.write_text(json.dumps(results, indent=2))
+
+    logging.info(f"Results written to {results_path}")
+
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
 
@@ -190,8 +222,15 @@ def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    env = OffScreenRenderEnv(**env_args)
+    # horizon=5000: the EEF wrapper takes up to 16 sim steps per policy action, so the
+    # default robosuite horizon (1000) truncates episodes before the 280-policy-step cap.
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+        "horizon": 5000,
+    }
+    env = LiberoEEFControlWrapper(OffScreenRenderEnv(**env_args))
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 
