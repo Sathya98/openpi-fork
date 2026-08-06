@@ -90,6 +90,7 @@ def check_fingerprint(result_dir: pathlib.Path, fingerprint: str) -> None:
     handle, tmp_name = tempfile.mkstemp(dir=str(result_dir), prefix=FINGERPRINT_FILE, suffix=".tmp")
     with os.fdopen(handle, "w") as tmp_file:
         tmp_file.write(fingerprint + "\n")
+    os.chmod(tmp_name, 0o644)  # mkstemp gives 0600; collaborators' workers must be able to read it
     os.replace(tmp_name, str(path))
 
 
@@ -201,11 +202,13 @@ def append_record(episodes_path: pathlib.Path, record: dict) -> None:
         episode_file.flush()
 
 
-def connect_policy_client(host: str, port: int, timeout_s: int = SERVER_WAIT_TIMEOUT_S):
+def connect_policy_client(host: str, port: int, timeout_s: int | None = None):
     """Wait for the policy server, but bound the wait: a launcher bug must fail, not burn the walltime."""
     import signal
 
     from openpi_client import websocket_client_policy
+
+    timeout_s = SERVER_WAIT_TIMEOUT_S if timeout_s is None else timeout_s
 
     def on_timeout(signum, frame):
         raise TimeoutError
@@ -215,7 +218,7 @@ def connect_policy_client(host: str, port: int, timeout_s: int = SERVER_WAIT_TIM
     try:
         return websocket_client_policy.WebsocketClientPolicy(host, port)
     except TimeoutError:
-        raise SystemExit(f"No policy server at {host}:{port} after {timeout_s // 60} min; giving up.") from None
+        raise SystemExit(f"No policy server at {host}:{port} after {timeout_s}s; giving up.") from None
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
