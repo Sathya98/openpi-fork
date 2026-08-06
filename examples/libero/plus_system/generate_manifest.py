@@ -26,6 +26,20 @@ CHECKPOINTS_ROOT = REPO_ROOT / "checkpoints"
 RESULTS_ROOT = REPO_ROOT / "results" / "libero_plus_system"
 DEFAULT_CLASSIFICATION_JSON = "/gpfs/work5/0/prjs2050/LIBERO-plus/libero/libero/benchmark/task_classification.json"
 
+FINGERPRINT_FIELDS = (
+    "checkpoints",
+    "classification_json",
+    "task_suite",
+    "perturbations",
+    "difficulties",
+    "base_tasks",
+    "trials_per_variant",
+    "replan_steps",
+    "seed",
+    "max_steps",
+    "num_shards",
+)
+
 # Object-suite variant names look like pick_up_the_<object>_and_place_it_in_the_basket_<suffix>;
 # the other suites do not encode a base task in the name.
 BASE_TASK_PATTERN = re.compile(r"pick_up_the_(.+?)_and_place_it_in_the_basket")
@@ -133,9 +147,17 @@ def shard_variants(variants: list[dict], num_shards: int) -> list[list[dict]]:
 
 
 def compute_fingerprint(resolved_config: dict, variants: list[dict]) -> str:
-    """Identity of this manifest: the runner refuses result dirs whose fingerprint differs."""
+    """Identity of this manifest: the runner refuses result dirs whose fingerprint differs.
+
+    Only fields that determine the episodes count; retuning num_workers or save_videos
+    must not invalidate a half-collected sweep. num_shards is included because resharding
+    moves variants between result dirs, which is exactly the double-counting hazard.
+    """
     payload = json.dumps(
-        {"config": resolved_config, "variants": sorted(v["name"] for v in variants)},
+        {
+            "config": {field: resolved_config[field] for field in FINGERPRINT_FIELDS},
+            "variants": sorted(v["name"] for v in variants),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
