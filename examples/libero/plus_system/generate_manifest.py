@@ -5,38 +5,23 @@ Reads a config (see configs/) selecting checkpoints x perturbations x difficulti
 base tasks, resolves it against the benchmark's task_classification.json and the
 checkpoints on disk, and writes shard files that the shard runner consumes.
 
-Must run inside the libero_plus_env (LIBERO-plus importable as `libero`).
+Stdlib only: runs under any python3.8+, no libero install needed.
 """
 
 import argparse
 import collections
-import ctypes
 import datetime
-import glob
 import json
-import os
 import pathlib
 import re
 import shutil
-import sys
 from typing import List, Optional
 
-# Importing main_plus pulls in libero, so replicate what the slurm scripts set up:
-# the plus env's own libero config (~/.libero points at the original LIBERO) and the
-# user-space ImageMagick that wand dlopen's. libMagickWand's libMagickCore dependency
-# only resolves if already loaded -- the slurm scripts use LD_LIBRARY_PATH for that,
-# which cannot be set from inside a running interpreter.
-os.environ.setdefault("LIBERO_CONFIG_PATH", str(pathlib.Path(sys.prefix) / ".libero"))
-os.environ.setdefault("MAGICK_HOME", "/gpfs/work5/0/prjs2050/tools/imagemagick")
-for magick_core_library in glob.glob(os.path.join(os.environ["MAGICK_HOME"], "lib", "libMagickCore*.so")):
-    ctypes.CDLL(magick_core_library, mode=ctypes.RTLD_GLOBAL)
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from libero.libero import get_libero_path  # noqa: E402
-from main_plus import PERTURBATION_CATEGORIES  # noqa: E402
+from perturbations import PERTURBATION_CATEGORIES
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 RESULTS_ROOT = REPO_ROOT / "results" / "libero_plus_system"
+DEFAULT_CLASSIFICATION_JSON = "/gpfs/work5/0/prjs2050/LIBERO-plus/libero/libero/benchmark/task_classification.json"
 
 # Variant names look like pick_up_the_<object>_and_place_it_in_the_basket_<suffix>.
 BASE_TASK_PATTERN = re.compile(r"pick_up_the_(.+?)_and_place_it_in_the_basket")
@@ -59,11 +44,14 @@ def resolve_checkpoint_step(config_name: str, step: Optional[int]) -> int:
 
 
 def select_variants(
-    task_suite: str, perturbations: List[str], difficulties: List[int], base_tasks: Optional[List[str]]
+    classification_json: str,
+    task_suite: str,
+    perturbations: List[str],
+    difficulties: List[int],
+    base_tasks: Optional[List[str]],
 ) -> List[dict]:
     """Filter task_classification.json entries down to the variants this eval covers."""
-    classification_path = pathlib.Path(get_libero_path("benchmark_root")) / "benchmark" / "task_classification.json"
-    entries = json.loads(classification_path.read_text())[task_suite]
+    entries = json.loads(pathlib.Path(classification_json).read_text())[task_suite]
 
     categories = {PERTURBATION_CATEGORIES[key] for key in perturbations}
     difficulty_set = set(difficulties)
@@ -123,8 +111,13 @@ def main() -> None:
         {"config": entry["config"], "step": resolve_checkpoint_step(entry["config"], entry["step"])}
         for entry in config["checkpoints"]
     ]
+    classification_json = config.get("classification_json", DEFAULT_CLASSIFICATION_JSON)
     variants = select_variants(
-        config["task_suite"], config["perturbations"], config["difficulties"], config["base_tasks"]
+        classification_json,
+        config["task_suite"],
+        config["perturbations"],
+        config["difficulties"],
+        config["base_tasks"],
     )
     shards = shard_variants(variants, config["num_shards"])
 
@@ -153,7 +146,7 @@ def main() -> None:
             }
             (shard_dir / f"{tag}_shard{shard_index}.json").write_text(json.dumps(shard_spec, indent=2))
 
-    resolved_config = dict(config, checkpoints=checkpoints)
+    resolved_config = dict(config, checkpoints=checkpoints, classification_json=classification_json)
     episodes_per_checkpoint = len(variants) * config["trials_per_variant"]
     manifest = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

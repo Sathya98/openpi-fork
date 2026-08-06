@@ -29,20 +29,10 @@ import tqdm
 import tyro
 
 from libero_eef_control_wrapper import LiberoEEFControlWrapper
+from plus_system.perturbations import PERTURBATION_CATEGORIES
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
-
-# CLI-friendly keys for the categories in task_classification.json.
-PERTURBATION_CATEGORIES = {
-    "camera": "Camera Viewpoints",
-    "robot": "Robot Initial States",
-    "language": "Language Instructions",
-    "light": "Light Conditions",
-    "background": "Background Textures",
-    "noise": "Sensor Noise",
-    "layout": "Objects Layout",
-}
 
 
 @dataclasses.dataclass
