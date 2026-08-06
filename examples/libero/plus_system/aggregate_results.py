@@ -5,8 +5,10 @@ Reads the manifest, parses every episode JSONL the workers appended under the
 checkpoint directories the manifest names, and writes all_episodes.csv/.parquet plus
 success-rate pivots next to them.
 
-Safe to run mid-run: a partial collection is reported, never an error. Only an eval
-with zero usable records exits non-zero.
+Safe to run mid-run: a partial collection is reported, never an error. It exits non-zero
+only when there is nothing to aggregate: no manifest, or no usable episode record. A
+mid-run scan is not a point-in-time snapshot either - workers keep appending while we
+read, so the shards are read at slightly different moments.
 
 Needs pandas; no libero, no GPU.
 """
@@ -18,8 +20,10 @@ import collections
 import dataclasses
 import itertools
 import json
+import os
 import pathlib
 import sys
+import tempfile
 
 import pandas as pd
 
@@ -46,21 +50,26 @@ REQUIRED_RECORD_KEYS = (
 
 @dataclasses.dataclass
 class EpisodeLoad:
-    records: list  # deduped, fingerprint-matching episode records
-    malformed_lines: int
+    records: list[dict]  # deduped, fingerprint-matching episode records
+    malformed_lines: int  # unusable lines, plus one per unreadable file
     stale_records: int
     duplicate_records: int
 
 
 def resolve_eval_dir(target: str, results_root: str) -> pathlib.Path:
-    """Accept either a path to an eval directory or an eval name under the results root."""
-    direct = pathlib.Path(target)
-    if direct.is_dir():
-        return direct.resolve()
+    """Accept an eval name under the results root, or a path to an eval directory.
+
+    The results root wins whenever it holds an eval of that name, so that a stray
+    directory of the same name in the working directory cannot shadow the real eval.
+    """
     root = pathlib.Path(results_root)
     if not root.is_absolute():
         root = REPO_ROOT / root
-    return (root / target).resolve()
+    under_root = root / target
+    if (under_root / "manifest.json").is_file():
+        return under_root.resolve()
+    direct = pathlib.Path(target)
+    return direct.resolve() if direct.is_dir() else under_root.resolve()
 
 
 def load_manifest(eval_dir: pathlib.Path) -> dict:
@@ -70,11 +79,12 @@ def load_manifest(eval_dir: pathlib.Path) -> dict:
     return json.loads(path.read_text())
 
 
-def checkpoint_tag(checkpoint: dict) -> str:
-    return "{}-{}".format(checkpoint["config"], checkpoint["step"])
+def checkpoint_tag(config: str, step) -> str:
+    """The directory name (and the frame's checkpoint key) of one checkpoint."""
+    return f"{config}-{step}"
 
 
-def episode_files(eval_dir: pathlib.Path, checkpoint_tags: list) -> list:
+def episode_files(eval_dir: pathlib.Path, checkpoint_tags: list[str]) -> list[pathlib.Path]:
     """Episode files of the checkpoints this manifest names.
 
     Deliberately not a wildcard over the eval directory: leftovers from other manifests
@@ -83,13 +93,37 @@ def episode_files(eval_dir: pathlib.Path, checkpoint_tags: list) -> list:
     return [path for tag in checkpoint_tags for path in sorted((eval_dir / tag).glob(EPISODE_FILE_GLOB))]
 
 
-def parse_episode_file(path: pathlib.Path) -> tuple:
+def record_problem(record: dict) -> str | None:
+    """Why this parsed line is not a usable episode record, or None if it is one.
+
+    This is the validation boundary for everything downstream: a null success would sit
+    in the mean but not in the size, and a null shard_index would break the completion
+    report's sort, so both are rejected here rather than silently skewing a rate.
+    """
+    missing = [key for key in REQUIRED_RECORD_KEYS if key not in record]
+    if missing:
+        return f"missing {missing}"
+    if not isinstance(record["success"], bool):
+        return f"success is {record['success']!r}, not a bool"
+    if not isinstance(record["shard_index"], int) or isinstance(record["shard_index"], bool):
+        return f"shard_index is {record['shard_index']!r}, not an int"
+    return None
+
+
+def parse_episode_file(path: pathlib.Path) -> tuple[list[dict], int]:
     """Records of one JSONL file plus the number of lines that were not usable records.
 
-    A worker killed mid-append leaves a half-written line; drop just that line.
+    A worker killed mid-append leaves a half-written line; drop just that line. A file
+    that vanished under us (a concurrent regeneration) counts as one unusable unit and
+    must not take the monitor down with it.
     """
     records, malformed = [], 0
-    with path.open() as episode_file:
+    try:
+        episode_file = path.open()
+    except (FileNotFoundError, PermissionError) as error:
+        print(f"WARNING: cannot read {path} ({error.__class__.__name__}); skipping it")
+        return [], 1
+    with episode_file:
         for line_number, raw_line in enumerate(episode_file, 1):
             line = raw_line.strip()
             if not line:
@@ -100,20 +134,22 @@ def parse_episode_file(path: pathlib.Path) -> tuple:
                 print(f"WARNING: unparsable line {line_number} of {path}")
                 malformed += 1
                 continue
-            missing = [key for key in REQUIRED_RECORD_KEYS if key not in record]
-            if missing:
-                print(f"WARNING: line {line_number} of {path} is missing {missing}")
+            problem = record_problem(record)
+            if problem is not None:
+                print(f"WARNING: line {line_number} of {path}: {problem}")
                 malformed += 1
                 continue
             records.append(record)
     return records, malformed
 
 
-def dedupe_records(records: list) -> tuple:
+def dedupe_records(records: list[dict]) -> tuple[list[dict], int]:
     """Keep the latest record per (checkpoint, variant, trial); return it and the number dropped.
 
     Duplicates are legitimate: a torn line hides an episode from the runner's resume set,
-    so it reruns it. finished_at is UTC ISO-8601, hence ordered lexicographically.
+    so it reruns it. finished_at is UTC ISO-8601 at second resolution, so string order is
+    time order; records sharing a second are settled by iteration order, which is the
+    sorted file order and therefore stable across runs.
     """
     latest = {}
     for record in records:
@@ -132,7 +168,7 @@ def dedupe_records(records: list) -> tuple:
 def load_episodes(eval_dir: pathlib.Path, manifest: dict) -> EpisodeLoad:
     """Read every episode of this eval, dropping records collected under another manifest."""
     fingerprint = manifest["config_fingerprint"]
-    tags = [checkpoint_tag(checkpoint) for checkpoint in manifest["config"]["checkpoints"]]
+    tags = [checkpoint_tag(c["config"], c["step"]) for c in manifest["config"]["checkpoints"]]
 
     records, malformed_lines, stale_records = [], 0, 0
     for path in episode_files(eval_dir, tags):
@@ -148,7 +184,7 @@ def load_episodes(eval_dir: pathlib.Path, manifest: dict) -> EpisodeLoad:
     return EpisodeLoad(deduped, malformed_lines, stale_records, duplicate_records)
 
 
-def shard_expectations(eval_dir: pathlib.Path, tag: str) -> dict:
+def shard_expectations(eval_dir: pathlib.Path, tag: str) -> dict[int, int]:
     """Episodes each shard of this checkpoint should end up holding, per its shard spec."""
     expectations = {}
     for path in sorted((eval_dir / "shards").glob(f"{tag}_shard*.json")):
@@ -157,14 +193,15 @@ def shard_expectations(eval_dir: pathlib.Path, tag: str) -> dict:
     return expectations
 
 
-def completion_rows(eval_dir: pathlib.Path, manifest: dict, records: list) -> list:
+def completion_rows(eval_dir: pathlib.Path, manifest: dict, records: list[dict]) -> list[dict]:
     """One row per (checkpoint, shard) with episodes recorded and expected."""
     recorded = collections.Counter(
         (record["checkpoint_config"], record["checkpoint_step"], record["shard_index"]) for record in records
     )
     rows = []
     for checkpoint in manifest["config"]["checkpoints"]:
-        expected = shard_expectations(eval_dir, checkpoint_tag(checkpoint))
+        tag = checkpoint_tag(checkpoint["config"], checkpoint["step"])
+        expected = shard_expectations(eval_dir, tag)
         counted = {
             shard_index: count
             for (config, step, shard_index), count in recorded.items()
@@ -172,7 +209,7 @@ def completion_rows(eval_dir: pathlib.Path, manifest: dict, records: list) -> li
         }
         rows.extend(
             {
-                "checkpoint": checkpoint_tag(checkpoint),
+                "checkpoint": tag,
                 "shard_index": shard_index,
                 "recorded": counted.get(shard_index, 0),
                 "expected": expected.get(shard_index, 0),
@@ -183,10 +220,17 @@ def completion_rows(eval_dir: pathlib.Path, manifest: dict, records: list) -> li
 
 
 def format_percent(recorded: int, expected: int) -> str:
-    return f"{100.0 * recorded / expected:5.1f}%" if expected else "    -"
+    """Progress of one line of the completion report.
+
+    'no spec!' flags episodes sitting in a shard the manifest has no spec for, which
+    means the results and the manifest disagree about the sharding.
+    """
+    if expected:
+        return f"{100.0 * recorded / expected:5.1f}%"
+    return "no spec!" if recorded else "    -"
 
 
-def print_completion(rows: list, load: EpisodeLoad) -> None:
+def print_completion(rows: list[dict], load: EpisodeLoad) -> None:
     print("Completion (episodes recorded / expected)")
     grand_recorded = grand_expected = 0
     for tag, group in itertools.groupby(rows, key=lambda row: row["checkpoint"]):
@@ -219,13 +263,16 @@ def print_completion(rows: list, load: EpisodeLoad) -> None:
         print("  WARNING: stale records were excluded; they were collected before the manifest changed.")
 
 
-def build_frame(records: list) -> pd.DataFrame:
+def build_frame(records: list[dict]) -> pd.DataFrame:
+    """The episode table every output is derived from, in a stable row order."""
     frame = pd.DataFrame(records)
-    frame["checkpoint"] = frame["checkpoint_config"] + "-" + frame["checkpoint_step"].astype(str)
+    frame["checkpoint"] = [checkpoint_tag(r["checkpoint_config"], r["checkpoint_step"]) for r in records]
+    # Fill here, not per pivot, so the CSV and the pivots spell a missing base task alike.
+    frame["base_task"] = frame["base_task"].fillna(NO_BASE_TASK)
     return frame.sort_values(["checkpoint", "shard_index", "variant_name", "trial_idx"], ignore_index=True)
 
 
-def group_success(frame: pd.DataFrame, keys: list) -> pd.DataFrame:
+def group_success(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     """Episodes, successes and success rate per group, one row per group."""
     grouped = frame.groupby(keys, dropna=False)["success"]
     return grouped.agg(episodes="size", successes="sum", success_rate="mean").reset_index()
@@ -233,8 +280,10 @@ def group_success(frame: pd.DataFrame, keys: list) -> pd.DataFrame:
 
 def format_matrix(summary: pd.DataFrame, index: str, columns: str) -> pd.DataFrame:
     """Cells as 'rate (n)': mid-run a success rate without its episode count means nothing."""
-    rates = summary.pivot(index=index, columns=columns, values="success_rate")
-    counts = summary.pivot(index=index, columns=columns, values="episodes")
+    # pivot, not pivot_table (hence the suppressions): group_success already emits one row
+    # per cell, so pivot_table could only add a silent second aggregation of these numbers.
+    rates = summary.pivot(index=index, columns=columns, values="success_rate")  # noqa: PD010
+    counts = summary.pivot(index=index, columns=columns, values="episodes")  # noqa: PD010
     formatted = rates.astype(object)
     for row in rates.index:
         for column in rates.columns:
@@ -243,16 +292,41 @@ def format_matrix(summary: pd.DataFrame, index: str, columns: str) -> pd.DataFra
     return formatted
 
 
-def write_tables(frame: pd.DataFrame, eval_dir: pathlib.Path, *, parquet: bool) -> None:
-    csv_path = eval_dir / "all_episodes.csv"
-    frame.to_csv(csv_path, index=False)
-    print(f"Wrote {csv_path} ({len(frame)} episodes)")
-    if not parquet:
-        return
-    parquet_path = eval_dir / "all_episodes.parquet"
+def write_atomic(path: pathlib.Path, write_to) -> None:
+    """Write through a temp file in the same directory, then rename it into place.
+
+    Same convention as the shard runner: a reader (or a second aggregator) polling these
+    tables must never catch a half-written one.
+    """
+    handle, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    os.close(handle)
     try:
-        frame.to_parquet(parquet_path, index=False)
+        write_to(tmp_name)
+    except Exception:
+        pathlib.Path(tmp_name).unlink(missing_ok=True)
+        raise
+    os.chmod(tmp_name, 0o644)  # mkstemp gives 0600; collaborators must be able to read the tables
+    os.replace(tmp_name, path)
+
+
+def write_tables(frame: pd.DataFrame, eval_dir: pathlib.Path, *, parquet: bool) -> None:
+    """Write all_episodes.csv, and the parquet twin unless it was turned off or is unsupported.
+
+    Whenever the parquet is not rewritten it is removed: a leftover from an earlier run
+    would quietly contradict the CSV next to it.
+    """
+    csv_path = eval_dir / "all_episodes.csv"
+    write_atomic(csv_path, lambda name: frame.to_csv(name, index=False))
+    print(f"Wrote {csv_path} ({len(frame)} episodes)")
+
+    parquet_path = eval_dir / "all_episodes.parquet"
+    if not parquet:
+        parquet_path.unlink(missing_ok=True)
+        return
+    try:
+        write_atomic(parquet_path, lambda name: frame.to_parquet(name, index=False))
     except ImportError:
+        parquet_path.unlink(missing_ok=True)
         print("Note: no parquet engine installed (pyarrow); wrote the CSV only.")
     else:
         print(f"Wrote {parquet_path}")
@@ -261,37 +335,33 @@ def write_tables(frame: pd.DataFrame, eval_dir: pathlib.Path, *, parquet: bool) 
 def write_pivots(frame: pd.DataFrame, eval_dir: pathlib.Path) -> None:
     pivot_dir = eval_dir / PIVOT_DIR
     pivot_dir.mkdir(exist_ok=True)
-    frame = frame.assign(base_task=frame["base_task"].fillna(NO_BASE_TASK))
 
-    def emit(title: str, summary: pd.DataFrame, file_name: str, matrix: tuple | None) -> None:
-        summary.to_csv(pivot_dir / file_name, index=False)
-        if matrix is not None:
+    def emit(title: str, keys: list[str], file_name: str) -> None:
+        summary = group_success(frame, keys)
+        write_atomic(pivot_dir / file_name, lambda name: summary.to_csv(name, index=False))
+        if len(keys) == 2:  # three keys do not fit a printed matrix; that CSV carries it alone
             print(f"\n{title}  [rate (episodes)]")
-            print(format_matrix(summary, *matrix).to_string())
+            print(format_matrix(summary, *keys).to_string())
 
     emit(
         "Success rate by checkpoint x perturbation category",
-        group_success(frame, ["checkpoint", "category"]),
+        ["checkpoint", "category"],
         "checkpoint_by_category.csv",
-        ("checkpoint", "category"),
     )
     emit(
         "Success rate by perturbation category x difficulty (all checkpoints pooled)",
-        group_success(frame, ["category", "difficulty"]),
+        ["category", "difficulty"],
         "category_by_difficulty.csv",
-        ("category", "difficulty"),
     )
     emit(
         "Success rate by checkpoint x category x difficulty",
-        group_success(frame, ["checkpoint", "category", "difficulty"]),
+        ["checkpoint", "category", "difficulty"],
         "category_by_difficulty_per_checkpoint.csv",
-        None,  # three keys do not fit a printed matrix; the CSV carries it
     )
     emit(
         "Success rate by base task x perturbation category (all checkpoints pooled)",
-        group_success(frame, ["base_task", "category"]),
+        ["base_task", "category"],
         "base_task_by_category.csv",
-        ("base_task", "category"),
     )
     print(f"\nWrote pivot CSVs to {pivot_dir}")
 
