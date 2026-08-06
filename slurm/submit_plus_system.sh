@@ -30,6 +30,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! [[ "$THROTTLE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: --throttle must be a positive integer, got '$THROTTLE'" >&2
+  exit 1
+fi
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: config not found: $CONFIG" >&2
   exit 1
@@ -45,12 +49,52 @@ MANIFEST="$OUT_DIR/manifest.json"
 JOB_MAP="$OUT_DIR/job_map.txt"
 
 # --- 1. Manifest: generate once, then reuse (the resume path) -----------------
+# Reusing a manifest that no longer matches the config would silently run the old
+# plan, so the config's result-determining fields must still agree with it.
 if [[ -f "$MANIFEST" ]]; then
-  FINGERPRINT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["config_fingerprint"])' "$MANIFEST")
-  echo "Using existing manifest $MANIFEST (fingerprint ${FINGERPRINT:0:16})"
+  python3 - "$CONFIG" "$MANIFEST" <<'PY'
+import json
+import pathlib
+import sys
+
+config, manifest = (json.loads(pathlib.Path(argument).read_text()) for argument in sys.argv[1:3])
+stored = manifest["config"]
+
+differing = [
+    field
+    for field in ("task_suite", "perturbations", "difficulties", "base_tasks", "trials_per_variant",
+                  "replan_steps", "seed", "max_steps")
+    if config[field] != stored[field]
+]
+if "classification_json" in config and config["classification_json"] != stored["classification_json"]:
+    differing.append("classification_json")
+# The generator clamps num_shards to the number of selected variants.
+if stored["num_shards"] != min(config["num_shards"], manifest["totals"]["num_variants"]):
+    differing.append("num_shards")
+# A null step in the config means "latest", which matches whatever step was resolved.
+requested = [(entry["config"], entry["step"]) for entry in config["checkpoints"]]
+resolved = [(entry["config"], entry["step"]) for entry in stored["checkpoints"]]
+if len(requested) != len(resolved) or any(
+    name != stored_name or (step is not None and step != stored_step)
+    for (name, step), (stored_name, stored_step) in zip(requested, resolved)
+):
+    differing.append("checkpoints")
+
+if differing:
+    raise SystemExit(
+        "ERROR: {} no longer matches the manifest; differing fields: {}\n"
+        "Regenerate it with:\n"
+        "  python3 examples/libero/plus_system/generate_manifest.py {} --force\n"
+        "(add --discard-results if episodes were already collected under that name).".format(
+            sys.argv[1], ", ".join(differing), sys.argv[1]
+        )
+    )
+print("Using existing manifest {} (fingerprint {})".format(sys.argv[2], manifest["config_fingerprint"][:16]))
+PY
 else
   echo "Generating manifest for '$NAME' ..."
   python3 examples/libero/plus_system/generate_manifest.py "$CONFIG"
+  echo "NOTE: generated a new manifest at $MANIFEST"
 fi
 
 # --- 2. Job map: array index -> shard file, in manifest order ----------------

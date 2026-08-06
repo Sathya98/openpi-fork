@@ -49,12 +49,14 @@ if [[ ! -f "$SHARD_FILE" ]]; then
   exit 1
 fi
 
+# Tab-separated: paths must survive the split even if one ever contains a space.
 FIELDS=$(python3 -c '
 import json, sys
 spec = json.load(open(sys.argv[1]))
-print(spec["checkpoint_config"], spec["checkpoint_dir"], spec["num_workers"], spec["result_dir"])
+print("\t".join(str(spec[key]) for key in
+                ("checkpoint_config", "checkpoint_dir", "num_workers", "result_dir")))
 ' "$SHARD_FILE")
-read -r CKPT_CONFIG CKPT_REL_DIR NUM_WORKERS RESULT_REL_DIR <<< "$FIELDS"
+IFS=$'\t' read -r CKPT_CONFIG CKPT_REL_DIR NUM_WORKERS RESULT_REL_DIR <<< "$FIELDS"
 CKPT_DIR="$REPO/$CKPT_REL_DIR"
 RESULT_DIR="$REPO/$RESULT_REL_DIR"
 mkdir -p "$RESULT_DIR"
@@ -105,6 +107,7 @@ done
 # points at the original LIBERO). MAGICK_HOME: user-space ImageMagick for wand.
 WORKER_PIDS=()
 for ((worker = 0; worker < NUM_WORKERS; worker++)); do
+  printf -v WORKER_LOG "%s/worker%02d_%s.log" "$RESULT_DIR" "$worker" "$TAG"
   LIBERO_CONFIG_PATH="$PLUS_ENV/.libero" \
   MAGICK_HOME="$IMAGEMAGICK" \
   LD_LIBRARY_PATH="$IMAGEMAGICK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -115,9 +118,9 @@ for ((worker = 0; worker < NUM_WORKERS; worker++)); do
     --host localhost \
     --port "$PORT" \
     --repo-root "$REPO" \
-    > "$RESULT_DIR/worker${worker}_$TAG.log" 2>&1 &
+    > "$WORKER_LOG" 2>&1 &
   WORKER_PIDS+=($!)
-  echo "Launched worker $worker (pid ${WORKER_PIDS[$worker]}) -> $RESULT_DIR/worker${worker}_$TAG.log"
+  echo "Launched worker $worker (pid ${WORKER_PIDS[$worker]}) -> $WORKER_LOG"
 done
 
 # Wait for every worker before reporting: one worker aborting on its error
