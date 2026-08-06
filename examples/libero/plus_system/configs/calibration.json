@@ -1,0 +1,17 @@
+{
+  "name": "calibration",
+  "checkpoints": [
+    {"config": "pi05_drema_libero_full_b32_15k", "step": null}
+  ],
+  "task_suite": "libero_object",
+  "perturbations": ["light", "background", "noise", "layout"],
+  "difficulties": [1, 2],
+  "base_tasks": ["alphabet_soup", "ketchup"],
+  "trials_per_variant": 3,
+  "replan_steps": 8,
+  "seed": 7,
+  "max_steps": 280,
+  "num_workers": 4,
+  "num_shards": 1,
+  "save_videos": "none"
+}
