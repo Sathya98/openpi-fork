@@ -44,6 +44,16 @@ FINGERPRINT_FIELDS = (
 # the other suites do not encode a base task in the name.
 BASE_TASK_PATTERN = re.compile(r"pick_up_the_(.+?)_and_place_it_in_the_basket")
 
+# Sensor Noise variants end in _noise_<N>, and N falls in a band of ten per corruption family.
+NOISE_SUFFIX_PATTERN = re.compile(r"_noise_(\d+)$")
+NOISE_FAMILIES = {
+    "motion_blur": (1, 10),
+    "gaussian_blur": (11, 20),
+    "zoom_blur": (21, 30),
+    "fog": (31, 40),
+    "glass_blur": (41, 50),
+}
+
 
 def resolve_checkpoint_step(config_name: str, step: int | None) -> int:
     """Return the requested step, or the latest one if step is null; verify params exist."""
@@ -137,6 +147,33 @@ def select_variants(
     return variants, skipped_null_difficulty
 
 
+def exclude_noise_families(variants: list[dict], families: list[str]) -> tuple[list[dict], dict[str, int]]:
+    """Drop variants whose _noise_<N> suffix falls in an excluded family's band.
+
+    Returns the surviving variants and the number excluded per requested family.
+    """
+    unknown = sorted(set(families) - set(NOISE_FAMILIES))
+    if unknown:
+        raise SystemExit(f"Unknown noise families {unknown}; valid families: {sorted(NOISE_FAMILIES)}")
+
+    bands = {family: NOISE_FAMILIES[family] for family in families}
+    kept = []
+    excluded_counts = {family: 0 for family in families}
+    for variant in variants:
+        match = NOISE_SUFFIX_PATTERN.search(variant["name"])
+        family = None
+        if match:
+            index = int(match.group(1))
+            family = next((name for name, (low, high) in bands.items() if low <= index <= high), None)
+        if family is None:
+            kept.append(variant)
+        else:
+            excluded_counts[family] += 1
+    if not kept:
+        raise SystemExit(f"exclude_noise_families {sorted(families)} excluded every selected variant.")
+    return kept, excluded_counts
+
+
 def shard_variants(variants: list[dict], num_shards: int) -> list[list[dict]]:
     """Round-robin over hardest-first order so every shard gets a similar slow/fast mix."""
     ordered = sorted(variants, key=lambda v: (-v["difficulty"], v["category"], v["name"]))
@@ -153,9 +190,15 @@ def compute_fingerprint(resolved_config: dict, variants: list[dict]) -> str:
     must not invalidate a half-collected sweep. num_shards is included because resharding
     moves variants between result dirs, which is exactly the double-counting hazard.
     """
+    payload_config = {field: resolved_config[field] for field in FINGERPRINT_FIELDS}
+    # exclude_noise_families is result-determining, but it only enters the payload when it
+    # actually excludes something: configs that never set it keep the fingerprint they were
+    # first generated under, so their already collected episodes still verify.
+    if resolved_config.get("exclude_noise_families"):
+        payload_config["exclude_noise_families"] = sorted(resolved_config["exclude_noise_families"])
     payload = json.dumps(
         {
-            "config": {field: resolved_config[field] for field in FINGERPRINT_FIELDS},
+            "config": payload_config,
             "variants": sorted(v["name"] for v in variants),
         },
         sort_keys=True,
@@ -212,6 +255,10 @@ def main() -> None:
     variants, skipped_null_difficulty = select_variants(
         records, config["perturbations"], config["difficulties"], config["base_tasks"]
     )
+    requested_families = config.get("exclude_noise_families", [])
+    excluded_counts = {}
+    if requested_families:
+        variants, excluded_counts = exclude_noise_families(variants, requested_families)
 
     num_shards = config["num_shards"]
     if num_shards < 1:
@@ -286,6 +333,10 @@ def main() -> None:
     for perturbation in sorted(config["perturbations"]):
         category = PERTURBATION_CATEGORIES[perturbation]
         print(f"  {category:<22} {category_counts[category]}")
+    if requested_families:
+        print("Excluded noise families (variants dropped):")
+        for family in sorted(excluded_counts):
+            print(f"  {family:<22} {excluded_counts[family]}")
     if skipped_null_difficulty:
         print(f"Skipped {skipped_null_difficulty} records with a null difficulty_level.")
     print("Shards (variants / episodes per checkpoint):")

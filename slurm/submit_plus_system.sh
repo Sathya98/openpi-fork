@@ -68,6 +68,9 @@ differing = [
 ]
 if "classification_json" in config and config["classification_json"] != stored["classification_json"]:
     differing.append("classification_json")
+# Optional field: a manifest generated before it existed means "exclude nothing".
+if sorted(config.get("exclude_noise_families", [])) != sorted(stored.get("exclude_noise_families", [])):
+    differing.append("exclude_noise_families")
 # The generator clamps num_shards to the number of selected variants.
 if stored["num_shards"] != min(config["num_shards"], manifest["totals"]["num_variants"]):
     differing.append("num_shards")
