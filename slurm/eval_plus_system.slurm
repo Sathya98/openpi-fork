@@ -105,12 +105,15 @@ done
 # --- 4. Shard workers (background, libero_plus_env) ---------------------------
 # LIBERO_CONFIG_PATH: this env's own config (must NOT read ~/.libero, which
 # points at the original LIBERO). MAGICK_HOME: user-space ImageMagick for wand.
+# *_NUM_THREADS=1: a worker needs ~1 core, but its BLAS would spawn nproc threads and
+# oversubscribe the node at 6+ workers.
 WORKER_PIDS=()
 for ((worker = 0; worker < NUM_WORKERS; worker++)); do
   printf -v WORKER_LOG "%s/worker%02d_%s.log" "$RESULT_DIR" "$worker" "$TAG"
   LIBERO_CONFIG_PATH="$PLUS_ENV/.libero" \
   MAGICK_HOME="$IMAGEMAGICK" \
   LD_LIBRARY_PATH="$IMAGEMAGICK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl "$PLUS_ENV/bin/python" examples/libero/plus_system/run_shard.py \
     --shard-file "$SHARD_FILE" \
     --worker-id "$worker" \
