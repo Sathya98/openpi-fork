@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -241,8 +242,9 @@ def test_torn_line_skipped_and_counted():
 
 
 def test_wrongly_typed_fields_refused():
-    # A null success would join the mean but not the size, and a null shard_index would
-    # break the completion report's sort; both are rejected, not repaired.
+    # A null success would join the mean but not the size, a null shard_index would break
+    # the completion report's sort, and a null checkpoint_step would rename the checkpoint
+    # every table groups by. All are rejected, not repaired.
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "episodes_worker00_1.jsonl"
         write_lines(
@@ -252,11 +254,14 @@ def test_wrongly_typed_fields_refused():
                 as_line(dict(record("v_alpha", 1, success=True), success=1)),
                 as_line(dict(record("v_beta", 0, success=True), shard_index=None)),
                 as_line(dict(record("v_beta", 1, success=True), shard_index="00")),
+                # bool is a subclass of int, so a plain isinstance check would admit these.
+                as_line(dict(record("v_beta", 1, success=True), shard_index=True)),
+                as_line(dict(record("v_gamma", 1, success=True), checkpoint_step=None)),
                 as_line(record("v_gamma", 0, success=False)),
             ],
         )
         records, malformed = aggregate_results.parse_episode_file(path)
-        assert (len(records), malformed) == (1, 4), (len(records), malformed)
+        assert (len(records), malformed) == (1, 6), (len(records), malformed)
         assert records[0]["variant_name"] == "v_gamma", records
 
 
@@ -399,7 +404,14 @@ def test_cli_writes_tables_and_pivots():
         eval_dir = build_eval_dir(tmp)
         completed = run_cli(eval_dir)
         assert completed.returncode == 0, completed.stdout + completed.stderr
-        assert "7 / 24" in completed.stdout, completed.stdout
+        # Verbatim lines: each of the three completion call sites must pass (recorded, expected)
+        # in that order, which a swapped call site would turn into 400.0% / 133.3% / 342.9%.
+        for line in (
+            "    shard00        1 / 4        25.0%",
+            "    all            6 / 8        75.0%",
+            "  TOTAL            7 / 24       29.2%",
+        ):
+            assert line in completed.stdout, (line, completed.stdout)
         assert "0.667 (3)" in completed.stdout, completed.stdout
         # The anomalies must reach whoever is watching the run, not just the counters.
         assert "WARNING: unparsable line 5 of" in completed.stdout, completed.stdout
@@ -422,6 +434,10 @@ def test_cli_writes_tables_and_pivots():
         assert per_checkpoint.splitlines()[0] == "checkpoint,category,difficulty,episodes,successes,success_rate"
         # The base_task pivot keeps the missing base task under a readable label.
         assert aggregate_results.NO_BASE_TASK in (eval_dir / "pivots" / "base_task_by_category.csv").read_text()
+        # Group-writable, like the manifest, the shard specs and the episode files.
+        for written_path in (eval_dir / "all_episodes.csv", eval_dir / "pivots" / "checkpoint_by_category.csv"):
+            mode = stat.S_IMODE(written_path.stat().st_mode)
+            assert mode == 0o660, (written_path, oct(mode))
         # The atomic writes must not leave their temp files behind.
         assert not list(eval_dir.glob("*.tmp*")), list(eval_dir.glob("*.tmp*"))
         assert not list((eval_dir / "pivots").glob("*.tmp*")), list((eval_dir / "pivots").glob("*.tmp*"))

@@ -93,20 +93,27 @@ def episode_files(eval_dir: pathlib.Path, checkpoint_tags: list[str]) -> list[pa
     return [path for tag in checkpoint_tags for path in sorted((eval_dir / tag).glob(EPISODE_FILE_GLOB))]
 
 
+def is_plain_int(value) -> bool:
+    """int, and not a bool sneaking through int's subclassing."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def record_problem(record: dict) -> str | None:
     """Why this parsed line is not a usable episode record, or None if it is one.
 
-    This is the validation boundary for everything downstream: a null success would sit
-    in the mean but not in the size, and a null shard_index would break the completion
-    report's sort, so both are rejected here rather than silently skewing a rate.
+    This is the validation boundary for everything downstream: a null success would sit in
+    the mean but not in the size, a null shard_index would break the completion report's
+    sort, and a null checkpoint_step would rename the checkpoint every table groups by.
+    All three are rejected here rather than silently skewing a rate.
     """
     missing = [key for key in REQUIRED_RECORD_KEYS if key not in record]
     if missing:
         return f"missing {missing}"
     if not isinstance(record["success"], bool):
         return f"success is {record['success']!r}, not a bool"
-    if not isinstance(record["shard_index"], int) or isinstance(record["shard_index"], bool):
-        return f"shard_index is {record['shard_index']!r}, not an int"
+    for key in ("checkpoint_step", "shard_index"):
+        if not is_plain_int(record[key]):
+            return f"{key} is {record[key]!r}, not an int"
     return None
 
 
@@ -305,7 +312,7 @@ def write_atomic(path: pathlib.Path, write_to) -> None:
     except Exception:
         pathlib.Path(tmp_name).unlink(missing_ok=True)
         raise
-    os.chmod(tmp_name, 0o644)  # mkstemp gives 0600; collaborators must be able to read the tables
+    os.chmod(tmp_name, 0o660)  # mkstemp gives 0600; the rest of the results tree is group-writable
     os.replace(tmp_name, path)
 
 
