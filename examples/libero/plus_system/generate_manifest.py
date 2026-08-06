@@ -8,28 +8,32 @@ checkpoints on disk, and writes shard files that the shard runner consumes.
 Stdlib only: runs under any python3.8+, no libero install needed.
 """
 
+from __future__ import annotations
+
 import argparse
 import collections
 import datetime
+import hashlib
 import json
 import pathlib
 import re
 import shutil
-from typing import List, Optional
 
 from perturbations import PERTURBATION_CATEGORIES
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+CHECKPOINTS_ROOT = REPO_ROOT / "checkpoints"
 RESULTS_ROOT = REPO_ROOT / "results" / "libero_plus_system"
 DEFAULT_CLASSIFICATION_JSON = "/gpfs/work5/0/prjs2050/LIBERO-plus/libero/libero/benchmark/task_classification.json"
 
-# Variant names look like pick_up_the_<object>_and_place_it_in_the_basket_<suffix>.
+# Object-suite variant names look like pick_up_the_<object>_and_place_it_in_the_basket_<suffix>;
+# the other suites do not encode a base task in the name.
 BASE_TASK_PATTERN = re.compile(r"pick_up_the_(.+?)_and_place_it_in_the_basket")
 
 
-def resolve_checkpoint_step(config_name: str, step: Optional[int]) -> int:
+def resolve_checkpoint_step(config_name: str, step: int | None) -> int:
     """Return the requested step, or the latest one if step is null; verify params exist."""
-    checkpoint_root = REPO_ROOT / "checkpoints" / config_name / "main"
+    checkpoint_root = CHECKPOINTS_ROOT / config_name / "main"
     if not checkpoint_root.is_dir():
         raise SystemExit(f"No checkpoint directory: {checkpoint_root}")
     if step is None:
@@ -43,56 +47,122 @@ def resolve_checkpoint_step(config_name: str, step: Optional[int]) -> int:
     return step
 
 
+def load_suite_records(classification_json: str, task_suite: str) -> list[dict]:
+    """Read the classification records of one task suite."""
+    path = pathlib.Path(classification_json)
+    if not path.is_file():
+        raise SystemExit(f"Classification file not found: {path}")
+    suites = json.loads(path.read_text())
+    if task_suite not in suites:
+        raise SystemExit(f"Unknown task suite '{task_suite}'; {path} has: {sorted(suites)}")
+    return suites[task_suite]
+
+
+def parse_base_task(variant_name: str) -> str | None:
+    match = BASE_TASK_PATTERN.match(variant_name)
+    return match.group(1) if match else None
+
+
 def select_variants(
-    classification_json: str,
-    task_suite: str,
-    perturbations: List[str],
-    difficulties: List[int],
-    base_tasks: Optional[List[str]],
-) -> List[dict]:
-    """Filter task_classification.json entries down to the variants this eval covers."""
-    entries = json.loads(pathlib.Path(classification_json).read_text())[task_suite]
+    records: list[dict],
+    perturbations: list[str],
+    difficulties: list[int],
+    base_tasks: list[str] | None,
+) -> tuple[list[dict], int]:
+    """Filter suite records down to the variants this eval covers.
+
+    Returns the variants and the number of records dropped for a null difficulty_level.
+    """
+    present_difficulties = {r["difficulty_level"] for r in records if r["difficulty_level"] is not None}
+    unmatched_difficulties = sorted(set(difficulties) - present_difficulties)
+    if unmatched_difficulties:
+        raise SystemExit(
+            f"Difficulties {unmatched_difficulties} match no record in this suite; "
+            f"available: {sorted(present_difficulties)}"
+        )
+
+    base_task_set = None
+    if base_tasks is not None:
+        present_base_tasks = {parse_base_task(r["name"]) for r in records} - {None}
+        if not present_base_tasks:
+            raise SystemExit("base_tasks filtering requested, but no variant name in this suite encodes a base task.")
+        unmatched_base_tasks = sorted(set(base_tasks) - present_base_tasks)
+        if unmatched_base_tasks:
+            raise SystemExit(
+                f"base_tasks {unmatched_base_tasks} match no record in this suite; "
+                f"available: {sorted(present_base_tasks)}"
+            )
+        base_task_set = set(base_tasks)
 
     categories = {PERTURBATION_CATEGORIES[key] for key in perturbations}
     difficulty_set = set(difficulties)
-    base_task_set = set(base_tasks) if base_tasks is not None else None
 
     variants = []
-    for entry in entries:
-        if entry["category"] not in categories or entry["difficulty_level"] not in difficulty_set:
+    skipped_null_difficulty = 0
+    for record in records:
+        if record["category"] not in categories:
             continue
-        match = BASE_TASK_PATTERN.match(entry["name"])
-        if match is None:
-            raise SystemExit("Cannot parse base task from variant name: {}".format(entry["name"]))
-        base_task = match.group(1)
+        if record["difficulty_level"] is None:
+            skipped_null_difficulty += 1
+            continue
+        if record["difficulty_level"] not in difficulty_set:
+            continue
+        base_task = parse_base_task(record["name"])
         if base_task_set is not None and base_task not in base_task_set:
             continue
         variants.append(
             {
-                "name": entry["name"],
+                "name": record["name"],
                 "base_task": base_task,
-                "category": entry["category"],
-                "difficulty": entry["difficulty_level"],
+                "category": record["category"],
+                "difficulty": record["difficulty_level"],
             }
         )
     if not variants:
         raise SystemExit("Selection matched zero variants; check perturbations/difficulties/base_tasks.")
-    return variants
+    return variants, skipped_null_difficulty
 
 
-def shard_variants(variants: List[dict], num_shards: int) -> List[List[dict]]:
+def shard_variants(variants: list[dict], num_shards: int) -> list[list[dict]]:
     """Round-robin over hardest-first order so every shard gets a similar slow/fast mix."""
     ordered = sorted(variants, key=lambda v: (-v["difficulty"], v["category"], v["name"]))
-    shards = [[] for _ in range(num_shards)]
+    shards: list[list[dict]] = [[] for _ in range(num_shards)]
     for index, variant in enumerate(ordered):
         shards[index % num_shards].append(variant)
     return shards
+
+
+def compute_fingerprint(resolved_config: dict, variants: list[dict]) -> str:
+    """Identity of this manifest: the runner refuses result dirs whose fingerprint differs."""
+    payload = json.dumps(
+        {"config": resolved_config, "variants": sorted(v["name"] for v in variants)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def resolve_checkpoints(entries: list[dict]) -> list[dict]:
+    checkpoints = [
+        {"config": entry["config"], "step": resolve_checkpoint_step(entry["config"], entry["step"])}
+        for entry in entries
+    ]
+    counts = collections.Counter((c["config"], c["step"]) for c in checkpoints)
+    duplicates = sorted(f"{name}@{step}" for (name, step), count in counts.items() if count > 1)
+    if duplicates:
+        raise SystemExit(f"Config lists the same checkpoint more than once: {duplicates}")
+    return checkpoints
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=pathlib.Path, help="Path to an eval config JSON.")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing output directory.")
+    parser.add_argument(
+        "--discard-results",
+        action="store_true",
+        help="With --force: delete already collected episodes and their result directories.",
+    )
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text())
@@ -106,34 +176,57 @@ def main() -> None:
         raise SystemExit(
             f"{output_dir} already exists; pass --force to regenerate (this may not match collected results)."
         )
+    collected = sorted(output_dir.glob("*/shard*/episodes_*.jsonl")) if output_dir.exists() else []
+    if collected and not args.discard_results:
+        raise SystemExit(
+            f"{output_dir} holds collected episodes ({len(collected)} files, e.g. "
+            f"{collected[0].relative_to(REPO_ROOT)}). Resharding would orphan those episodes and double-count "
+            "variants that move to another shard. Pass --discard-results to delete them and regenerate."
+        )
 
-    checkpoints = [
-        {"config": entry["config"], "step": resolve_checkpoint_step(entry["config"], entry["step"])}
-        for entry in config["checkpoints"]
-    ]
+    checkpoints = resolve_checkpoints(config["checkpoints"])
     classification_json = config.get("classification_json", DEFAULT_CLASSIFICATION_JSON)
-    variants = select_variants(
-        classification_json,
-        config["task_suite"],
-        config["perturbations"],
-        config["difficulties"],
-        config["base_tasks"],
+    records = load_suite_records(classification_json, config["task_suite"])
+    variants, skipped_null_difficulty = select_variants(
+        records, config["perturbations"], config["difficulties"], config["base_tasks"]
     )
-    shards = shard_variants(variants, config["num_shards"])
+
+    num_shards = config["num_shards"]
+    if num_shards < 1:
+        raise SystemExit(f"num_shards must be at least 1, got {num_shards}")
+    if num_shards > len(variants):
+        print(f"WARNING: num_shards {num_shards} exceeds the {len(variants)} selected variants; using {len(variants)}.")
+        num_shards = len(variants)
+    shards = shard_variants(variants, num_shards)
+
+    resolved_config = dict(
+        config,
+        checkpoints=checkpoints,
+        classification_json=classification_json,
+        num_shards=num_shards,
+    )
+    fingerprint = compute_fingerprint(resolved_config, variants)
 
     shard_dir = output_dir / "shards"
     if shard_dir.exists():
         shutil.rmtree(shard_dir)
+    if args.discard_results:
+        for result_dir in sorted(p for p in output_dir.glob("*") if p.is_dir()):
+            print(f"Discarding {result_dir.relative_to(REPO_ROOT)}")
+            shutil.rmtree(result_dir)
     shard_dir.mkdir(parents=True)
 
     for checkpoint in checkpoints:
         tag = "{}-{}".format(checkpoint["config"], checkpoint["step"])
+        checkpoint_dir = CHECKPOINTS_ROOT / checkpoint["config"] / "main" / str(checkpoint["step"])
         for shard_index, shard in enumerate(shards):
+            shard_name = f"shard{shard_index:02d}"
             shard_spec = {
                 "eval_name": config["name"],
+                "config_fingerprint": fingerprint,
                 "checkpoint_config": checkpoint["config"],
                 "checkpoint_step": checkpoint["step"],
-                "checkpoint_dir": "checkpoints/{}/main/{}".format(checkpoint["config"], checkpoint["step"]),
+                "checkpoint_dir": str(checkpoint_dir.relative_to(REPO_ROOT)),
                 "task_suite": config["task_suite"],
                 "replan_steps": config["replan_steps"],
                 "seed": config["seed"],
@@ -141,20 +234,22 @@ def main() -> None:
                 "num_workers": config["num_workers"],
                 "save_videos": config["save_videos"],
                 "trials_per_variant": config["trials_per_variant"],
-                "result_dir": "results/libero_plus_system/{}/{}/shard{}".format(config["name"], tag, shard_index),
+                "shard_index": shard_index,
+                "num_shards": num_shards,
+                "result_dir": str((output_dir / tag / shard_name).relative_to(REPO_ROOT)),
                 "variants": shard,
             }
-            (shard_dir / f"{tag}_shard{shard_index}.json").write_text(json.dumps(shard_spec, indent=2))
+            (shard_dir / f"{tag}_{shard_name}.json").write_text(json.dumps(shard_spec, indent=2))
 
-    resolved_config = dict(config, checkpoints=checkpoints, classification_json=classification_json)
     episodes_per_checkpoint = len(variants) * config["trials_per_variant"]
     manifest = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "config_fingerprint": fingerprint,
         "config": resolved_config,
         "variants": variants,
         "totals": {
             "num_variants": len(variants),
-            "num_shards": config["num_shards"],
+            "num_shards": num_shards,
             "episodes_per_checkpoint": episodes_per_checkpoint,
             "total_episodes": episodes_per_checkpoint * len(checkpoints),
         },
@@ -162,16 +257,21 @@ def main() -> None:
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     print("Eval '{}' -> {}".format(config["name"], output_dir))
+    print(f"Fingerprint: {fingerprint[:16]}")
     print("Checkpoints: " + ", ".join("{}@{}".format(c["config"], c["step"]) for c in checkpoints))
     print("Variants by category:")
     category_counts = collections.Counter(v["category"] for v in variants)
-    for category in sorted(category_counts):
+    for perturbation in sorted(config["perturbations"]):
+        category = PERTURBATION_CATEGORIES[perturbation]
         print(f"  {category:<22} {category_counts[category]}")
+    if skipped_null_difficulty:
+        print(f"Skipped {skipped_null_difficulty} records with a null difficulty_level.")
     print("Shards (variants / episodes per checkpoint):")
     for shard_index, shard in enumerate(shards):
         print("  shard{:<3} {:>5} {:>7}".format(shard_index, len(shard), len(shard) * config["trials_per_variant"]))
     print(
-        f"Total: {len(variants)} variants, {episodes_per_checkpoint} episodes per checkpoint, {episodes_per_checkpoint * len(checkpoints)} episodes overall"
+        f"Total: {len(variants)} variants, {episodes_per_checkpoint} episodes per checkpoint, "
+        f"{episodes_per_checkpoint * len(checkpoints)} episodes overall"
     )
 
 

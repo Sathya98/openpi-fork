@@ -6,7 +6,7 @@
   "task_suite": "libero_object",
   "perturbations": ["light", "background", "noise", "layout"],
   "difficulties": [1, 2],
-  "base_tasks": ["alphabet_soup", "ketchup"],
+  "base_tasks": ["salad_dressing", "ketchup"],
   "trials_per_variant": 3,
   "replan_steps": 8,
   "seed": 7,
