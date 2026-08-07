@@ -15,7 +15,7 @@
   "replan_steps": 8,
   "seed": 7,
   "max_steps": 280,
-  "num_workers": 12,
+  "num_workers": 15,
   "num_shards": 8,
   "save_videos": "failures_first_trial"
 }

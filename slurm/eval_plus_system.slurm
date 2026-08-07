@@ -73,9 +73,10 @@ echo "Workers:     $NUM_WORKERS | port=$PORT"
 nvidia-smi -L
 
 # --- 2. Policy server (background, pi_env) ------------------------------------
-# Cap JAX preallocation so the EGL renderer has GPU memory headroom.
+# Cap JAX preallocation so the EGL renderers have GPU memory headroom
+# (model is ~8 GB bf16; 0.4 x 40 GB leaves room for 15 workers' renderers).
 SERVER_LOG="$RESULT_DIR/server_$TAG.log"
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.6 "$PI_ENV/bin/python" scripts/serve_policy.py \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 "$PI_ENV/bin/python" scripts/serve_policy.py \
   --port "$PORT" \
   policy:checkpoint --policy.config "$CKPT_CONFIG" --policy.dir "$CKPT_DIR" \
   > "$SERVER_LOG" 2>&1 &
