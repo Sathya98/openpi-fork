@@ -2,7 +2,8 @@
 # Submit a LIBERO-plus eval config as one slurm array job (one task per shard).
 #
 # Usage:
-#   bash slurm/submit_plus_system.sh <config.json> [--partition P] [--throttle N] [--time T] [--dry-run]
+#   bash slurm/submit_plus_system.sh <config.json> [--partition P] [--throttle N] [--time T]
+#                                    [--defer-noise-families a,b] [--dry-run]
 # e.g.
 #   bash slurm/submit_plus_system.sh examples/libero/plus_system/configs/l123_sweep.json
 #   bash slurm/submit_plus_system.sh examples/libero/plus_system/configs/calibration.json --dry-run
@@ -10,6 +11,13 @@
 # The manifest is generated only if it does not exist yet, so resubmitting the
 # same config resumes the sweep (the shard runner skips recorded episodes)
 # instead of resharding it.
+#
+# --defer-noise-families holds those families back for THIS submission only: it is a
+# runtime filter in the workers, so the manifest, its fingerprint and every episode
+# already recorded stay valid, and a later submission without the flag collects the
+# deferred variants as ordinary pending work. Use it to run the cheap variants first;
+# do NOT move the families into the config's exclude_noise_families instead -- that
+# field is fingerprinted, so changing it strands every episode already collected.
 
 set -euo pipefail
 
@@ -20,11 +28,13 @@ PARTITION=""
 TIME_LIMIT=""
 THROTTLE=8  # concurrent array tasks: the account's job budget
 DRY_RUN=0
+DEFER_FAMILIES=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --partition) PARTITION=${2:?--partition needs a value}; shift 2 ;;
     --throttle) THROTTLE=${2:?--throttle needs a value}; shift 2 ;;
     --time) TIME_LIMIT=${2:?--time needs a value}; shift 2 ;;
+    --defer-noise-families) DEFER_FAMILIES=${2:?--defer-noise-families needs a value}; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -158,9 +168,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     tail -1 "$JOB_MAP"
   fi
   echo "--- would run ---"
-  echo "sbatch ${SBATCH_OPTS[*]} slurm/eval_plus_system.slurm $JOB_MAP"
+  echo "sbatch ${SBATCH_OPTS[*]} slurm/eval_plus_system.slurm $JOB_MAP $DEFER_FAMILIES"
   exit 0
 fi
 
-sbatch "${SBATCH_OPTS[@]}" slurm/eval_plus_system.slurm "$JOB_MAP"
+sbatch "${SBATCH_OPTS[@]}" slurm/eval_plus_system.slurm "$JOB_MAP" "$DEFER_FAMILIES"
 echo "Submitted $COUNT shard tasks for '$NAME'. Check status with: squeue -u \$USER"

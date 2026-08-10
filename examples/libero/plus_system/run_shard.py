@@ -32,6 +32,14 @@ EPISODE_FILE_GLOB = "episodes_worker*.jsonl"
 MAX_CONSECUTIVE_ERRORS = 3
 SERVER_WAIT_TIMEOUT_S = 15 * 60
 
+# The noise-family bands belong to the manifest generator (stdlib only, so it imports
+# under the client env too); sharing them keeps a deferred run and the manifest's own
+# exclude_noise_families from ever drifting apart.
+PLUS_SYSTEM_DIR = pathlib.Path(__file__).resolve().parent
+if str(PLUS_SYSTEM_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUS_SYSTEM_DIR))
+import generate_manifest  # noqa: E402  needs PLUS_SYSTEM_DIR on the path
+
 REQUIRED_SPEC_KEYS = (
     "eval_name",
     "config_fingerprint",
@@ -111,6 +119,40 @@ def load_done_episodes(result_dir: pathlib.Path) -> set:
                     continue
                 done.add((record["variant_name"], record["trial_idx"]))
     return done
+
+
+def parse_family_list(value: str | None) -> list:
+    """Split a comma-separated --defer-noise-families value; absent or empty defers nothing."""
+    if not value:
+        return []
+    return [family.strip() for family in value.split(",") if family.strip()]
+
+
+def defer_noise_families(variants: list, families: list) -> list:
+    """Hold back the named noise families for this run only.
+
+    Purely a runtime filter: the manifest, its fingerprint and every recorded episode
+    are untouched, so a later run without the flag sees the held-back variants as
+    ordinary pending work and fills them in. Unlike the generator's
+    exclude_noise_families this tolerates an empty result -- a worker whose entire
+    stride is deferred simply has nothing to do and must not abort the shard.
+    """
+    if not families:
+        return list(variants)
+    unknown = sorted(set(families) - set(generate_manifest.NOISE_FAMILIES))
+    if unknown:
+        raise SystemExit(
+            f"Unknown noise families {unknown}; valid: {sorted(generate_manifest.NOISE_FAMILIES)}"
+        )
+    bands = [generate_manifest.NOISE_FAMILIES[family] for family in families]
+    kept = []
+    for variant in variants:
+        match = generate_manifest.NOISE_SUFFIX_PATTERN.search(variant["name"])
+        index = int(match.group(1)) if match else None
+        if index is not None and any(low <= index <= high for low, high in bands):
+            continue
+        kept.append(variant)
+    return kept
 
 
 def owned_variants(variants: list, worker_id: int, num_workers: int) -> list:
@@ -353,6 +395,14 @@ def main() -> None:
     parser.add_argument(
         "--repo-root", type=pathlib.Path, default=REPO_ROOT, help="Root that the spec's result_dir is relative to."
     )
+    parser.add_argument(
+        "--defer-noise-families",
+        type=str,
+        default="",
+        help="Comma-separated noise families to hold back this run (e.g. motion_blur,zoom_blur). "
+        "Reversible: the manifest and fingerprint are untouched, so a later run without the "
+        "flag fills the deferred variants in.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -374,7 +424,20 @@ def main() -> None:
         )
     )
 
-    variants = owned_variants(spec["variants"], args.worker_id, args.num_workers)
+    # Defer before striding, so the surviving work spreads evenly over the workers
+    # instead of idling whoever happened to own the deferred variants.
+    selected = spec["variants"]
+    deferred_families = parse_family_list(args.defer_noise_families)
+    if deferred_families:
+        kept = defer_noise_families(selected, deferred_families)
+        logging.info(
+            "Deferring {}: holding back {} of {} variants this run "
+            "(manifest and fingerprint unchanged; rerun without the flag to collect them)".format(
+                ", ".join(sorted(deferred_families)), len(selected) - len(kept), len(selected)
+            )
+        )
+        selected = kept
+    variants = owned_variants(selected, args.worker_id, args.num_workers)
     trials_per_variant = spec["trials_per_variant"]
     pending = pending_episodes(variants, trials_per_variant, load_done_episodes(result_dir))
     owned_episodes = len(variants) * trials_per_variant

@@ -294,6 +294,68 @@ def test_result_dir_is_repo_relative():
     assert resolved == pathlib.Path("/repo/results/libero_plus_system/calibration/ckpt-1/shard00"), resolved
 
 
+def noise_variants(count=50):
+    """One Sensor Noise variant per severity index, spanning all five families."""
+    return [
+        {
+            "name": f"pick_up_the_ketchup_and_place_it_in_the_basket_noise_{i}",
+            "base_task": "ketchup",
+            "category": "Sensor Noise",
+            "difficulty": 2,
+        }
+        for i in range(1, count + 1)
+    ]
+
+
+def test_deferring_a_family_drops_only_its_band():
+    kept = run_shard.defer_noise_families(noise_variants(), ["zoom_blur"])
+    indices = sorted(int(v["name"].rsplit("_", 1)[1]) for v in kept)
+    assert indices == [i for i in range(1, 51) if not 21 <= i <= 30], indices
+
+
+def test_deferring_nothing_is_a_no_op():
+    variants = noise_variants()
+    assert run_shard.defer_noise_families(variants, []) == variants
+
+
+def test_deferring_leaves_non_noise_variants_alone():
+    others = SPEC["variants"]
+    kept = run_shard.defer_noise_families(others + noise_variants(), ["motion_blur", "zoom_blur"])
+    assert [v for v in kept if v["category"] != "Sensor Noise"] == others
+
+
+def test_deferring_every_owned_variant_yields_nothing_to_do():
+    # A worker whose whole stride is deferred must return empty, not abort the shard.
+    assert run_shard.defer_noise_families(noise_variants()[20:30], ["zoom_blur"]) == []
+
+
+def test_unknown_family_is_rejected():
+    try:
+        run_shard.defer_noise_families(noise_variants(), ["zoomblur"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an unknown noise family was accepted")
+
+
+def test_deferral_matches_the_manifest_generator_bands():
+    # run_shard must classify families exactly as generate_manifest does, or a deferred
+    # run and a regenerated manifest would disagree about which variants exist.
+    import generate_manifest
+
+    for family in generate_manifest.NOISE_FAMILIES:
+        deferred = run_shard.defer_noise_families(noise_variants(), [family])
+        excluded, _ = generate_manifest.exclude_noise_families(noise_variants(), [family])
+        assert deferred == excluded, family
+
+
+def test_family_list_parses_from_comma_separated_flag():
+    assert run_shard.parse_family_list("motion_blur,zoom_blur") == ["motion_blur", "zoom_blur"]
+    assert run_shard.parse_family_list(" motion_blur , zoom_blur ") == ["motion_blur", "zoom_blur"]
+    assert run_shard.parse_family_list("") == []
+    assert run_shard.parse_family_list(None) == []
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = []

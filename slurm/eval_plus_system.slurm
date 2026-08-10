@@ -24,7 +24,10 @@
 
 set -euo pipefail
 
-JOB_MAP=${1:?Usage: sbatch --array=0-<K-1>%<throttle> slurm/eval_plus_system.slurm <job_map.txt>}
+JOB_MAP=${1:?Usage: sbatch --array=0-<K-1>%<throttle> slurm/eval_plus_system.slurm <job_map.txt> [defer_families]}
+# Optional: comma-separated noise families to hold back this run (e.g. motion_blur,zoom_blur).
+# Passed positionally rather than through --export, whose own list is comma-separated.
+DEFER_FAMILIES=${2:-}
 TASK_ID=${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is unset; submit this script with --array}
 
 REPO=/gpfs/work5/0/prjs2050/openpi-fork
@@ -70,6 +73,9 @@ echo "Shard file:  $SHARD_FILE"
 echo "Checkpoint:  $CKPT_CONFIG @ $CKPT_DIR"
 echo "Result dir:  $RESULT_DIR"
 echo "Workers:     $NUM_WORKERS | port=$PORT"
+if [[ -n "$DEFER_FAMILIES" ]]; then
+  echo "Deferring:   $DEFER_FAMILIES (held back this run; manifest and fingerprint unchanged)"
+fi
 nvidia-smi -L
 
 # --- 2. Policy server (background, pi_env) ------------------------------------
@@ -122,6 +128,7 @@ for ((worker = 0; worker < NUM_WORKERS; worker++)); do
     --host localhost \
     --port "$PORT" \
     --repo-root "$REPO" \
+    --defer-noise-families "$DEFER_FAMILIES" \
     > "$WORKER_LOG" 2>&1 &
   WORKER_PIDS+=($!)
   echo "Launched worker $worker (pid ${WORKER_PIDS[$worker]}) -> $WORKER_LOG"
