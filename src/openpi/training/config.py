@@ -937,6 +937,48 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # Real pepper dataset (data/pepper_var_real10ep_lrd): single front camera + instruction only.
+    # Verbatim copy of pi05_drema_lora_b32_15k with batch_size=16 and the pepper repo_id.
+    # pepper_var_real10ep's wrist_image is a byte-identical copy of the front camera, so
+    # DremaDataConfig (masks wrist + state) is the correct input setup here.
+    #
+    TrainConfig(
+        name="pi05_pepper_lora_b16_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="pepper_var_real10ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        # Freeze filter must match the LoRA model variants chosen above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
     # Same setup as the DREMA configs above (front camera + instruction only, no wrist, no state)
     # but trained on the LIBERO-object dataset (data/libero_object_original_filtered3ep_lrd).
     # NOTE: this LIBERO set has a *real* wrist camera; DremaDataConfig deliberately masks it so the
@@ -1056,6 +1098,89 @@ _CONFIGS = [
             pi05=True,
             action_horizon=8,
             discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Same DREMA/LIBERO setup as pi05_drema_libero_lora_b32_15k (front camera + instruction only;
+    # DremaDataConfig masks the real wrist camera and state so the input setup matches the other
+    # DREMA baselines) but trained on the recgen LIBERO-object set (data/libero_object_recgen_filtered3ep_lrd).
+    # Hyperparameters copied verbatim; only the name and repo_id differ.
+    #
+    TrainConfig(
+        name="pi05_drema_libero_recgen_lora_b32_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="libero_object_recgen_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Proprio-ON variant of pi05_drema_libero_recgen_lora_b32_15k: identical recipe + data (same
+    # recgen _lrd, single front cam, wrist still masked), but discrete_state_input=True so the 8-dim
+    # EEF-pose+gripper `state` IS fed to pi0.5 (discretized into the prompt tokens). Isolates the
+    # effect of proprioception vs the proprio-off baseline. NOTE: proprio here is EEF pose + gripper
+    # only -- joint angles are NOT included (they were dropped at _lrd conversion).
+    #
+    TrainConfig(
+        name="pi05_drema_libero_recgen_lora_b32_15k_pp",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="libero_object_recgen_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
