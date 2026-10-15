@@ -81,3 +81,61 @@ class DremaOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Return only the first 7 action dims (the rest is padding up to the model action_dim).
         return {"actions": np.asarray(data["actions"][:, :7])}
+
+
+def _r6_to_matrix(r6: np.ndarray) -> np.ndarray:
+    """(..., 6) = [R[:,0], R[:,1]] -> (..., 3, 3), Gram-Schmidt, so a predicted pair need not be orthonormal."""
+    a, b = r6[..., :3], r6[..., 3:6]
+    x = a / np.linalg.norm(a, axis=-1, keepdims=True)
+    y = b - x * np.sum(x * b, axis=-1, keepdims=True)
+    y = y / np.linalg.norm(y, axis=-1, keepdims=True)
+    return np.stack([x, y, np.cross(x, y)], axis=-1)
+
+
+def _matrix_to_r6(m: np.ndarray) -> np.ndarray:
+    return np.concatenate([m[..., :, 0], m[..., :, 1]], axis=-1)
+
+
+@dataclasses.dataclass(frozen=True)
+class RelativePoseActions(transforms.DataTransformFn):
+    """Pose actions (xyz + r6, then gripper) as offsets from the state at the chunk start.
+
+    `DeltaActions` subtracts all nine pose numbers; for the rotation that is not a rotation.
+    Here xyz is p_k - p_0 and the rotation is R_k R_0^T (base frame, like xyz), as r6. The
+    gripper stays absolute.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        if "actions" not in data:
+            return data
+        state, actions = np.asarray(data["state"]), np.array(data["actions"], copy=True)
+        r0 = _r6_to_matrix(state[3:9])
+        actions[..., :3] -= state[:3]
+        actions[..., 3:9] = _matrix_to_r6(_r6_to_matrix(actions[..., 3:9]) @ r0.T)
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class AbsolutePoseActions(transforms.DataTransformFn):
+    """The inverse of `RelativePoseActions`: p_k = p_0 + d, R_k = dR R_0."""
+
+    def __call__(self, data: dict) -> dict:
+        if "actions" not in data:
+            return data
+        state, actions = np.asarray(data["state"]), np.array(data["actions"], copy=True)
+        r0 = _r6_to_matrix(state[3:9])
+        actions[..., :3] += state[:3]
+        actions[..., 3:9] = _matrix_to_r6(_r6_to_matrix(actions[..., 3:9]) @ r0)
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class DremaPoseOutputs(transforms.DataTransformFn):
+    """FrankaJointPos actions: hand pose (xyz + r6) and gripper, 10 dims."""
+
+    action_dim: int = 10
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

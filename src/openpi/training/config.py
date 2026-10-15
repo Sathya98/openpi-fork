@@ -23,6 +23,7 @@ import openpi.policies.drema_policy as drema_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -395,6 +396,60 @@ class DremaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class DremaDeltaDataConfig(DataConfigFactory):
+    """DremaDataConfig on robot-stack FrankaJointPos data, with chunk-relative actions.
+
+    State = hand pose (xyz + r6) + gripper; actions = absolute target pose + gripper. openpi's
+    DeltaActions makes the 9 pose dims relative to the state at the chunk start, gripper stays
+    absolute. The state only anchors the deltas: with discrete_state_input=False the model
+    still sees front image + prompt only.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {"observation/image": "image", "observation/state": "state", "actions": "actions", "prompt": "prompt"}
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[drema_policy.DremaInputs(model_type=model_config.model_type)],
+            outputs=[drema_policy.DremaPoseOutputs()],
+        )
+        delta_mask = _transforms.make_bool_mask(9, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_mask)],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class DremaRelPoseDataConfig(DremaDeltaDataConfig):
+    """`DremaDeltaDataConfig` with the pose made relative properly: xyz offset and R_k R_0^T
+    (`drema_policy.RelativePoseActions`) instead of subtracting the r6 numbers."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        data_transforms = _transforms.Group(
+            inputs=[drema_policy.DremaInputs(model_type=model_config.model_type)],
+            outputs=[drema_policy.DremaPoseOutputs()],
+        ).push(
+            inputs=[drema_policy.RelativePoseActions()],
+            outputs=[drema_policy.AbsolutePoseActions()],
+        )
+        return dataclasses.replace(config, data_transforms=data_transforms)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -863,6 +918,78 @@ _CONFIGS = [
         keep_period=7_500,
         fsdp_devices=1,
     ),
+    # pi05_drema_full_b32_15k on the 10 real + 10 aligned DreMa pepper episodes. Added on lennard to
+    # serve a checkpoint trained elsewhere: its assets are under pepper_var_both10ep_aligned_lrd.
+    TrainConfig(
+        name="pi05_pepper_both10ep_aligned_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="pepper_var_both10ep_aligned_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=7_500,
+        keep_period=7_500,
+        fsdp_devices=1,
+    ),
+    # pi05_drema_full_b32_15k on pepper_var_real3ep_aligned_lrd, 6k steps. Added on lennard to serve a checkpoint
+    # trained elsewhere; its norm stats are under the repo_id.
+    TrainConfig(
+        name="pi05_pepper_real3ep_aligned_full_b32_6k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="pepper_var_real3ep_aligned_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=6_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6_000,
+        save_interval=3_000,
+        keep_period=3_000,
+        fsdp_devices=1,
+    ),
+    # pi05_drema_full_b32_15k on pepper_var_both3ep_aligned_lrd, 6k steps. Added on lennard to serve a checkpoint
+    # trained elsewhere; its norm stats are under the repo_id.
+    TrainConfig(
+        name="pi05_pepper_both3ep_aligned_full_b32_6k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="pepper_var_both3ep_aligned_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=6_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6_000,
+        save_interval=3_000,
+        keep_period=3_000,
+        fsdp_devices=1,
+    ),
     # --- LoRA fine-tune. Fits comfortably on a single GPU. EMA disabled per LoRA convention. ---
     TrainConfig(
         name="pi05_drema_lora_b8_150k",
@@ -914,6 +1041,136 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        # Freeze filter must match the LoRA model variants chosen above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Real pepper dataset (data/pepper_var_real10ep_lrd): single front camera + instruction only.
+    # Verbatim copy of pi05_drema_lora_b32_15k with batch_size=16 and the pepper repo_id.
+    # pepper_var_real10ep's wrist_image is a byte-identical copy of the front camera, so
+    # DremaDataConfig (masks wrist + state) is the correct input setup here.
+    #
+    TrainConfig(
+        name="pi05_pepper_lora_b16_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="pepper_var_real10ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        # Freeze filter must match the LoRA model variants chosen above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Same setup as the DREMA configs above (front camera + instruction only, no wrist, no state)
+    # but trained on the LIBERO-object dataset (data/libero_object_original_filtered3ep_lrd).
+    # NOTE: this LIBERO set has a *real* wrist camera; DremaDataConfig deliberately masks it so the
+    # input setup is identical to the real-robot DREMA runs. Hyperparameters are copied verbatim;
+    # only the name and repo_id differ.
+    #
+    # The same recipe on all 18 real episodes (data/pepper_var_real18ep_lrd); the 8 the corpus held out fill the x band it leaves empty.
+    TrainConfig(
+        name="pi05_pepper_real18ep_lora_b16_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="pepper_var_real18ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps.
+        save_interval=7_500,
+        keep_period=7_500,
+        # Freeze filter must match the LoRA model variants chosen above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Same setup as the DREMA configs above (front camera + instruction only, no wrist, no state)
+    # but trained on the LIBERO-object dataset (data/libero_object_original_filtered3ep_lrd).
+    # NOTE: this LIBERO set has a *real* wrist camera; DremaDataConfig deliberately masks it so the
+    # input setup is identical to the real-robot DREMA runs. Hyperparameters are copied verbatim;
+    # only the name and repo_id differ.
+    #
+    # The same recipe on the 10 real episodes plus their 10 aligned DreMa twins (data/pepper_var_both10ep_aligned_lrd), the corpus of the aligned OpenVLA runs.
+    TrainConfig(
+        name="pi05_pepper_both10ep_aligned_lora_b16_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="pepper_var_both10ep_aligned_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=2.5e-5,
@@ -1268,6 +1525,215 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # pi05_drema_full_b32_15k recipe on robot-stack FrankaJointPos pepper data (9 real + 9 DreMa,
+    # matched 3x3 grid), chunk-relative actions; 15k steps, a checkpoint every 1.5k, 2-GPU FSDP.
+    TrainConfig(
+        name="pi05_pepper_old_delta_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDeltaDataConfig(
+            repo_id="pepper_old_all_crop_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=1_500,
+        keep_period=1_500,
+        fsdp_devices=2,
+    ),
+    # pi05_drema_full_b32_15k recipe on robot-stack FrankaJointPos pepper data (9 real + 9 DreMa,
+    # matched 3x3 grid), chunk-relative actions; 15k steps, a checkpoint every 1.5k, 2-GPU FSDP.
+    TrainConfig(
+        name="pi05_pepper_jointpos_delta_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDeltaDataConfig(
+            repo_id="pepper_jointpos_all_crop_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=1_500,
+        keep_period=1_500,
+        fsdp_devices=2,
+    ),
+    # pi05_drema_full_b32_15k recipe on robot-stack FrankaJointPos pepper data (9 real only,
+    # matched 3x3 grid), chunk-relative actions; 15k steps, a checkpoint every 1.5k, 2-GPU FSDP.
+    TrainConfig(
+        name="pi05_pepper_old_real_delta_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDeltaDataConfig(
+            repo_id="pepper_old_real_crop_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=1_500,
+        keep_period=1_500,
+        fsdp_devices=2,
+    ),
+    # pi05_drema_full_b32_15k recipe on robot-stack FrankaJointPos pepper data (9 real only,
+    # matched 3x3 grid), chunk-relative actions; 15k steps, a checkpoint every 1.5k, 2-GPU FSDP.
+    TrainConfig(
+        name="pi05_pepper_jointpos_real_delta_full_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDeltaDataConfig(
+            repo_id="pepper_jointpos_real_crop_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=1_500,
+        keep_period=1_500,
+        fsdp_devices=2,
+    ),
+    # The pepper delta recipe with less of the model trained, against memorising 18 demos
+    # (full FT snaps to the 9 training grasps). One H100 each; same data, steps, schedule.
+    *[
+        TrainConfig(
+            name=f"pi05_pepper_{arm}_delta_{variant}_b32_15k",
+            model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False, **model_kw),
+            data=DremaDeltaDataConfig(
+                repo_id=f"pepper_{arm}_all_crop_lrd", base_config=DataConfig(prompt_from_task=True)
+            ),
+            batch_size=32,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000, peak_lr=peak_lr, decay_steps=15_000, decay_lr=peak_lr / 10
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=ema_decay,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            num_train_steps=15_000,
+            save_interval=1_500,
+            keep_period=1_500,
+            freeze_filter=freeze,
+            fsdp_devices=2 if variant == "frozenvis" else 1,
+        )
+        for arm in ("old", "jointpos")
+        for variant, model_kw, peak_lr, ema_decay, freeze in (
+            # openpi's LoRA recipe (adapters on both Gemmas), plus SigLIP frozen: openpi's LoRA
+            # filter covers only the Gemmas, so its LoRA runs still train all of SigLIP.
+            (
+                "lora",
+                {"paligemma_variant": "gemma_2b_lora", "action_expert_variant": "gemma_300m_lora"},
+                2.5e-5,
+                None,
+                nnx.Any(
+                    pi0_config.Pi0Config(
+                        pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+                    ).get_freeze_filter(),
+                    nnx_utils.PathRegex(".*img.*"),
+                ),
+            ),
+            # Only the action expert (and its in/out projections) trains; the VLM stays pi05_base.
+            (
+                "expert",
+                {},
+                5e-5,
+                0.999,
+                nnx.Any(
+                    nnx_utils.PathRegex(".*img.*"),
+                    nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*"))),
+                ),
+            ),
+            # SigLIP frozen, both Gemmas trained.
+            ("frozenvis", {}, 5e-5, 0.999, nnx_utils.PathRegex(".*img.*")),
+        )
+    ],
+    # 3 demos (05, 06, 14: real + DreMa twin, old pipeline), chunk-relative with a proper relative
+    # rotation. 3 demos overfit fast, so 7.5k steps and a checkpoint every 750.
+    *[
+        TrainConfig(
+            name=f"pi05_pepper3_rel_{variant}_b32_7k5",
+            model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False, **model_kw),
+            data=DremaRelPoseDataConfig(
+                repo_id="pepper_old3_05_06_14_crop_lrd", base_config=DataConfig(prompt_from_task=True)
+            ),
+            batch_size=32,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=750, peak_lr=peak_lr, decay_steps=7_500, decay_lr=peak_lr / 10
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            ema_decay=ema_decay,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            num_train_steps=7_500,
+            save_interval=750,
+            keep_period=750,
+            freeze_filter=freeze,
+            fsdp_devices=2 if variant == "full" else 1,
+        )
+        for variant, model_kw, peak_lr, ema_decay, freeze in (
+            ("full", {}, 5e-5, 0.999, nnx.Nothing()),
+            # openpi's own LoRA recipe: adapters on both Gemmas, SigLIP still trains.
+            (
+                "lora",
+                {"paligemma_variant": "gemma_2b_lora", "action_expert_variant": "gemma_300m_lora"},
+                2.5e-5,
+                None,
+                pi0_config.Pi0Config(
+                    pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+                ).get_freeze_filter(),
+            ),
+            # The same with SigLIP frozen.
+            (
+                "lorafv",
+                {"paligemma_variant": "gemma_2b_lora", "action_expert_variant": "gemma_300m_lora"},
+                2.5e-5,
+                None,
+                nnx.Any(
+                    pi0_config.Pi0Config(
+                        pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+                    ).get_freeze_filter(),
+                    nnx_utils.PathRegex(".*img.*"),
+                ),
+            ),
+            # Only the action expert and its projections.
+            (
+                "expert",
+                {},
+                5e-5,
+                0.999,
+                nnx.Any(
+                    nnx_utils.PathRegex(".*img.*"),
+                    nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*"))),
+                ),
+            ),
+        )
+    ],
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
