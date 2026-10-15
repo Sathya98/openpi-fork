@@ -76,6 +76,9 @@ def main(checkpoint_dir: str, config_name: str, output_path: str, precision: str
 
     # The converter looks for assets next to the step dir; openpi saves them inside it.
     shutil.copytree(pathlib.Path(checkpoint_dir) / "assets", pathlib.Path(output_path) / "assets", dirs_exist_ok=True)
+    # RL4VLAs reads the norm stats from <checkpoint>/<asset_id>/, not assets/<asset_id>/.
+    for asset in (pathlib.Path(checkpoint_dir) / "assets").iterdir():
+        shutil.copytree(asset, pathlib.Path(output_path) / asset.name, dirs_exist_ok=True)
     cfg = pathlib.Path(output_path) / "config.json"
     cfg.write_text(json.dumps({**json.loads(cfg.read_text()), "config_name": config_name,
                                "source": str(checkpoint_dir), "lora_merged": "lora" in "".join(variants)}, indent=2))
