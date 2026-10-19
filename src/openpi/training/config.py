@@ -1694,8 +1694,12 @@ _CONFIGS = [
             freeze_filter=freeze,
             fsdp_devices=2 if variant == "full" else 1,
         )
-        # pot3: slide_pot_on_stove 11, 12, 16 (real + aligned DreMa twin), the same recipe.
-        for task, repo_id in (("pepper3", "pepper_old3_05_06_14_crop_lrd"), ("pot3", "pot3_11_12_16_crop_lrd"))
+        # pot3: slide_pot_on_stove 11, 12, 16 (real + aligned DreMa twin); pot1: 01 alone. The same recipe.
+        for task, repo_id in (
+            ("pepper3", "pepper_old3_05_06_14_crop_lrd"),
+            ("pot3", "pot3_11_12_16_crop_lrd"),
+            ("pot1", "pot1_01_crop_lrd"),
+        )
         for variant, model_kw, peak_lr, ema_decay, freeze in (
             ("full", {}, 5e-5, 0.999, nnx.Nothing()),
             # openpi's own LoRA recipe: adapters on both Gemmas, SigLIP still trains.
