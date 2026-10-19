@@ -19,11 +19,12 @@ p = argparse.ArgumentParser()
 p.add_argument("episodes", nargs="+")
 p.add_argument("--src", type=Path, default=Path.home() / "rlds-episodes/pepper-in-pan")
 p.add_argument("--out", required=True)
+p.add_argument("--task", default="put the green bell pepper in the pan")
 args = p.parse_args()
 SRC, EPS, OUT = args.src, args.episodes, args.out
 # Feature layout of the robot-stack recordings (FrankaJointPos).
 TEMPLATE = LeRobotDataset("fr3-vislab/put-the-green-bell-pepper-in-the-pan")
-TASK = "put the green bell pepper in the pan"
+TASK = args.task
 
 
 root = HF_LEROBOT_HOME / OUT
