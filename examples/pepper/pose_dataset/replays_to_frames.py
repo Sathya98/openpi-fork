@@ -4,16 +4,18 @@ The render is slightly off the real camera, so it is regridded onto it: an ECC a
 of render frame 0 onto real frame 0, Lanczos, then 1280x720. Sim state from
 object_poses.pkl, one row per frame. Output dirs are numbered in episode order.
 
-    python replays_to_frames.py <replays_dir> <out_dir> 05 06 14
+    python replays_to_frames.py [--real <extracted episodes>] <replays_dir> <out_dir> 05 06 14
 """
 import pickle, sys
 from pathlib import Path
 import cv2, numpy as np, pandas as pd
 from scipy.spatial.transform import Rotation as R
 
-SRC, OUT = Path(sys.argv[1]), Path(sys.argv[2])
-REAL = Path.home() / "rlds-episodes/pepper-in-pan"
-EPS = sys.argv[3:]
+args = sys.argv[1:]
+REAL = Path.home() / "rlds-episodes/pepper-in-pan"  # the real episodes the replays came from
+if args[:1] == ["--real"]:
+    REAL, args = Path(args[1]), args[2:]
+SRC, OUT, EPS = Path(args[0]), Path(args[1]), args[2:]
 def gray(a): return cv2.GaussianBlur(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), (5, 5), 0)
 
 for idx, ep in enumerate(EPS):
