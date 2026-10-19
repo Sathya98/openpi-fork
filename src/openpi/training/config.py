@@ -1678,11 +1678,9 @@ _CONFIGS = [
     # rotation. 3 demos overfit fast, so 7.5k steps and a checkpoint every 750.
     *[
         TrainConfig(
-            name=f"pi05_pepper3_rel_{variant}_b32_7k5",
+            name=f"pi05_{task}_rel_{variant}_b32_7k5",
             model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False, **model_kw),
-            data=DremaRelPoseDataConfig(
-                repo_id="pepper_old3_05_06_14_crop_lrd", base_config=DataConfig(prompt_from_task=True)
-            ),
+            data=DremaRelPoseDataConfig(repo_id=repo_id, base_config=DataConfig(prompt_from_task=True)),
             batch_size=32,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=750, peak_lr=peak_lr, decay_steps=7_500, decay_lr=peak_lr / 10
@@ -1696,6 +1694,8 @@ _CONFIGS = [
             freeze_filter=freeze,
             fsdp_devices=2 if variant == "full" else 1,
         )
+        # pot3: slide_pot_on_stove 11, 12, 16 (real + aligned DreMa twin), the same recipe.
+        for task, repo_id in (("pepper3", "pepper_old3_05_06_14_crop_lrd"), ("pot3", "pot3_11_12_16_crop_lrd"))
         for variant, model_kw, peak_lr, ema_decay, freeze in (
             ("full", {}, 5e-5, 0.999, nnx.Nothing()),
             # openpi's own LoRA recipe: adapters on both Gemmas, SigLIP still trains.
