@@ -25,9 +25,10 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import tensorflow_datasets as tfds
 import tyro
 
-REPO_NAME = "libero_object_recgen_filtered3ep_lrd"  # Name of the output dataset, also used for the Hugging Face Hub
+REPO_NAME = "pepper_var_both10ep_aligned_lrd"  # Name of the output dataset, also used for the Hugging Face Hub
 RAW_DATASET_NAMES = [
-    "libero_object_recgen_filtered3ep",
+    "pepper_var_both10ep_aligned",
+    # "libero_object_recgen_filtered3ep",
     # "pepper_var_real10ep",
     # "libero_object_original_filtered3ep",
     # "place_pots_and_slides_real5ep",

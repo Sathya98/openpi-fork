@@ -1095,6 +1095,79 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # Same two configs (proprio OFF / ON) on the "both" (sim+real aligned) pepper dataset,
+    # rotation-fixed (data/pepper_var_both10ep_aligned_rotfix_lrd). Identical hyperparameters
+    # to the real-only rotfix configs above; only repo_id changes.
+    #
+    TrainConfig(
+        name="pi05_pepper_both_rotfix_lora_b32_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="pepper_var_both10ep_aligned_rotfix_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=7_500,
+        keep_period=7_500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_pepper_both_rotfix_lora_b32_15k_pp",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DremaDataConfig(
+            repo_id="pepper_var_both10ep_aligned_rotfix_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=7_500,
+        keep_period=7_500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=8,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
     # Same setup as the DREMA configs above (front camera + instruction only, no wrist, no state)
     # but trained on the LIBERO-object dataset (data/libero_object_original_filtered3ep_lrd).
     # NOTE: this LIBERO set has a *real* wrist camera; DremaDataConfig deliberately masks it so the
