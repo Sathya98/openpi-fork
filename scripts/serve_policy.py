@@ -28,6 +28,9 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Flow-matching denoising steps per inference; the model's own default (10) when unset.
+    # RLinf trains and evaluates its PPO actors at 5, so those are served at 5.
+    num_steps: int | None = None
 
 
 @dataclasses.dataclass
@@ -90,7 +93,10 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs={"num_steps": args.policy.num_steps} if args.policy.num_steps else None,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
