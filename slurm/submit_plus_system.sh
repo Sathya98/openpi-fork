@@ -50,7 +50,7 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 CONFIG=$(readlink -f "$CONFIG")
 
-REPO=/gpfs/work5/0/prjs2050/openpi-fork
+REPO=/gpfs/work2/0/prjs2280/exmachina/openpi-fork
 cd "$REPO"
 
 NAME=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$CONFIG")

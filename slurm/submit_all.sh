@@ -1,7 +1,7 @@
 #!/bin/bash
 # Submit all eight DREMA training jobs via the unified launcher.
 # Usage:  bash slurm/submit_all.sh
-# Run from the repo root (/gpfs/work5/0/prjs2050/openpi-fork).
+# Run from the repo root (/gpfs/work2/0/prjs2280/exmachina/openpi-fork).
 
 set -euo pipefail
 

@@ -26,15 +26,19 @@
 
 set -euo pipefail
 
-CONFIG=${1:?Usage: sbatch slurm/train_drema.slurm <config_name> [exp_name]}
+CONFIG=${1:?Usage: sbatch slurm/train_drema.slurm <config_name> [exp_name] [extra train.py args...]}
 EXP_NAME=${2:-main}
+# Anything after exp_name is passed to scripts/train.py verbatim (e.g. --no-wandb-enabled).
+EXTRA_ARGS=("${@:3}")
 
-REPO=/gpfs/work5/0/prjs2050/openpi-fork
+REPO=/gpfs/work2/0/prjs2280/exmachina/openpi-fork
 cd "$REPO"
+# pi05_base params + paligemma tokenizer are cached here (openpi.shared.download layout).
+export OPENPI_DATA_HOME=/gpfs/work2/0/prjs2280/exmachina/openpi_ckpts
 mkdir -p slurm/logs
 
 # Use the existing environment (openpi + jax[cuda] + wandb installed).
-source /gpfs/work5/0/prjs2050/pi_env/bin/activate
+source /gpfs/work2/0/prjs2280/exmachina/pi_env/bin/activate
 
 # LeRobotDataset resolves repo_id under HF_LEROBOT_HOME -> data/<repo_id>.
 export HF_LEROBOT_HOME="$REPO/data"
@@ -42,7 +46,7 @@ export HF_LEROBOT_HOME="$REPO/data"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 # W&B: requires WANDB_API_KEY in the environment, or a prior `wandb login` (~/.netrc).
 export WANDB_PROJECT=${WANDB_PROJECT:-openpi-drema}
-if [[ -z "${WANDB_API_KEY:-}" && ! -f "$HOME/.netrc" ]]; then
+if [[ " ${EXTRA_ARGS[*]} " != *" --no-wandb-enabled "* && -z "${WANDB_API_KEY:-}" && ! -f "$HOME/.netrc" ]]; then
   echo "ERROR: W&B logging is enabled but no WANDB_API_KEY and no ~/.netrc found." >&2
   echo "       Run 'wandb login' once on the login node, or export WANDB_API_KEY." >&2
   exit 1
@@ -65,6 +69,6 @@ else
 fi
 
 echo "=== Step 2/2: train ==="
-python scripts/train.py "$CONFIG" --exp-name="$EXP_NAME" $RESUME_FLAG
+python scripts/train.py "$CONFIG" --exp-name="$EXP_NAME" $RESUME_FLAG "${EXTRA_ARGS[@]}"
 
 echo "=== Done. Checkpoints in $CKPT_DIR ==="

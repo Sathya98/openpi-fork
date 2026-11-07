@@ -1,7 +1,7 @@
 #!/bin/bash
 # Submit LIBERO evals for all four libero-trained DREMA checkpoints (latest step each).
 # Usage:  bash slurm/submit_all_evals.sh [trials_per_task]
-# Run from the repo root (/gpfs/work5/0/prjs2050/openpi-fork).
+# Run from the repo root (/gpfs/work2/0/prjs2280/exmachina/openpi-fork).
 #
 # Only the *_libero_* configs are evaluable in LIBERO; the drema-real checkpoints
 # (pi05_drema_full/lora_*) are real-robot models with no sim benchmark.

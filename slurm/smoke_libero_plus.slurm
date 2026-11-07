@@ -21,11 +21,13 @@ set -euo pipefail
 CONFIG=${1:-pi05_drema_libero_full_b32_15k}
 STEP=${2:-}
 
-REPO=/gpfs/work5/0/prjs2050/openpi-fork
-PI_ENV=/gpfs/work5/0/prjs2050/pi_env
-PLUS_ENV=/gpfs/work5/0/prjs2050/libero_plus_env
-IMAGEMAGICK=/gpfs/work5/0/prjs2050/tools/imagemagick
+REPO=/gpfs/work2/0/prjs2280/exmachina/openpi-fork
+PI_ENV=/gpfs/work2/0/prjs2280/exmachina/pi_env
+PLUS_ENV=/gpfs/work2/0/prjs2280/exmachina/libero_plus_env
+IMAGEMAGICK=/gpfs/work2/0/prjs2280/exmachina/tools/imagemagick
 cd "$REPO"
+# pi05_base params + paligemma tokenizer are cached here (openpi.shared.download layout).
+export OPENPI_DATA_HOME=/gpfs/work2/0/prjs2280/exmachina/openpi_ckpts
 mkdir -p slurm/logs
 
 if [[ -z "$STEP" ]]; then

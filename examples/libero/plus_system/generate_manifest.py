@@ -24,7 +24,7 @@ from perturbations import PERTURBATION_CATEGORIES
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 CHECKPOINTS_ROOT = REPO_ROOT / "checkpoints"
 RESULTS_ROOT = REPO_ROOT / "results" / "libero_plus_system"
-DEFAULT_CLASSIFICATION_JSON = "/gpfs/work5/0/prjs2050/LIBERO-plus/libero/libero/benchmark/task_classification.json"
+DEFAULT_CLASSIFICATION_JSON = "/gpfs/work2/0/prjs2280/exmachina/LIBERO-plus/libero/libero/benchmark/task_classification.json"
 
 FINGERPRINT_FIELDS = (
     "checkpoints",

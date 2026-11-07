@@ -31,11 +31,13 @@ STEP=${3:-}
 TASK_SUITE=${TASK_SUITE:-libero_object}
 REPLAN_STEPS=${REPLAN_STEPS:-8}
 
-REPO=/gpfs/work5/0/prjs2050/openpi-fork
-PI_ENV=/gpfs/work5/0/prjs2050/pi_env
-PLUS_ENV=/gpfs/work5/0/prjs2050/libero_plus_env
-IMAGEMAGICK=/gpfs/work5/0/prjs2050/tools/imagemagick
+REPO=/gpfs/work2/0/prjs2280/exmachina/openpi-fork
+PI_ENV=/gpfs/work2/0/prjs2280/exmachina/pi_env
+PLUS_ENV=/gpfs/work2/0/prjs2280/exmachina/libero_plus_env
+IMAGEMAGICK=/gpfs/work2/0/prjs2280/exmachina/tools/imagemagick
 cd "$REPO"
+# pi05_base params + paligemma tokenizer are cached here (openpi.shared.download layout).
+export OPENPI_DATA_HOME=/gpfs/work2/0/prjs2280/exmachina/openpi_ckpts
 mkdir -p slurm/logs
 
 # Default to the latest checkpoint step for this config.
