@@ -46,12 +46,15 @@ PY="$TARGET/bin/python"
 #    (e.g. protobuf==7.35 violates google-api-core 2.24.2's declared protobuf<7). The
 #    freeze already lists every transitive dep pinned, so we place them verbatim and
 #    skip re-resolution. GIT_LFS_SKIP_SMUDGE keeps the lerobot git clone light.
+#    --no-config is REQUIRED too: when run from inside this repo, uv would otherwise apply
+#    pyproject.toml's [tool.uv] override-dependencies (ml-dtypes==0.4.1), which breaks
+#    tensorflow 2.21 (needs ml_dtypes.float4_e2m1fn, i.e. the frozen 0.5.4).
 echo "== installing frozen snapshot ($REQ)"
-GIT_LFS_SKIP_SMUDGE=1 uv pip install --python "$PY" --no-deps -r "$REQ"
+GIT_LFS_SKIP_SMUDGE=1 uv pip install --python "$PY" --no-config --no-deps -r "$REQ"
 
 # 2) the two editable workspace members, from this repo, without perturbing the closure
 echo "== installing editable openpi + openpi-client (--no-deps)"
-uv pip install --python "$PY" --no-deps -e "$REPO_ROOT" -e "$REPO_ROOT/packages/openpi-client"
+uv pip install --python "$PY" --no-config --no-deps -e "$REPO_ROOT" -e "$REPO_ROOT/packages/openpi-client"
 
 echo "== sanity check"
 "$PY" - <<'PY'
