@@ -22,6 +22,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.drema_policy as drema_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -1332,6 +1333,45 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
+    ),
+    #
+    # Action-expert-only full finetune on the recgen LIBERO-object set: same data/input setup as
+    # pi05_drema_libero_recgen_lora_b32_15k (DremaDataConfig, front cam + instruction, no proprio),
+    # but no LoRA. Everything is frozen (and cast to bf16 by train.py) except the action expert:
+    # the gemma_300m expert weights inside the LLM (nnx paths `...llm...*_1*`) plus its action/time
+    # projections. PaliGemma (SigLIP + gemma_2b) stays frozen. Hyperparameters follow the
+    # full-finetune b32/15k recipe (pi05_drema_libero_full_b32_15k).
+    #
+    TrainConfig(
+        name="pi05_drema_libero_recgen_expert_b32_15k",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=8, discrete_state_input=False),
+        data=DremaDataConfig(
+            repo_id="libero_object_recgen_filtered3ep_lrd",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        # Short run: save & keep every 7.5k steps -> 2 permanent checkpoints (7500 + final).
+        save_interval=7_500,
+        keep_period=7_500,
+        # Freeze = NOT(action expert). Trainable: `.../llm/.../*_1/...` (expert attn/mlp/norms)
+        # and the pi05 action-expert heads action_in_proj / action_out_proj / time_mlp_in / time_mlp_out.
+        freeze_filter=nnx.Not(
+            nnx.Any(
+                nnx_utils.PathRegex(".*llm.*_1.*"),
+                nnx_utils.PathRegex(r"(.*/)?(action_in_proj|action_out_proj|time_mlp_in|time_mlp_out)/.*"),
+            )
+        ),
+        fsdp_devices=1,
     ),
     #
     # Proprio-ON variant of pi05_drema_libero_recgen_lora_b32_15k: identical recipe + data (same
